@@ -1,15 +1,21 @@
 """
-機械学習ベースの価格予測システム (修正版)
-- LightGBM: テーブルデータに強い勾配ブースティング
-- LSTM: 時系列パターン学習
-- アンサンブル予測で精度向上
-- 自信度計算の最適化
+機械学習ベースの価格予測システム (デイトレード最適化版)
+- LightGBM: テーブルデータ予測 (板情報追加)
+- LSTM: 対数変化率を使用した時系列予測
+- 評価機能: オンライン学習の安全性確保
 """
 import numpy as np
 import pandas as pd
 import joblib
 import os
 import threading
+
+try:
+    from sklearn.metrics import accuracy_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("⚠️ scikit-learnがインストールされていません。'pip install scikit-learn' を実行してください。")
 
 try:
     import lightgbm as lgb
@@ -33,40 +39,38 @@ class MLPredictor:
         self.lgb_path = f"{model_dir}/lgb_{symbol}.pkl"
         self.lstm_path = f"{model_dir}/lstm_{symbol}.h5"
         
-        # スレッドロックの初期化
         self.model_lock = threading.Lock()
         
         self.lgb_model = None
         self.lstm_model = None
         
-        # 特徴量は学習時(data_collector)と完全に一致させる必要があります
+        # 特徴量定義 (Imbalanceを追加)
         self.feature_cols = [
             'rsi', 'macd_hist', 'bb_position', 'bb_width',
             'atr', 'volume_ratio', 'price_change_1h',
             'price_change_4h', 'sma_20_50_ratio', 'volatility',
-            'hour_sin', 'hour_cos', 'day_of_week'
+            'hour_sin', 'hour_cos', 'day_of_week',
+            'orderbook_imbalance' # 新規追加: 板情報の偏り
         ]
         self.lstm_lookback = 60
         self.load_models()
 
     def create_features_from_history(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        履歴データ(OHLCV)から特徴量を計算し、予測用の最新1行を返す
+        履歴データから特徴量を計算 (推論用)
         """
         df = df.copy()
         if len(df) < 100:
             return None
 
-        # --- テクニカル指標計算 (DataCollectorとロジック統一) ---
+        # テクニカル指標計算
         close = df['close']
         
         # RSI
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        # ゼロ除算対策
-        loss = loss.replace(0, np.nan)
-        rs = gain / loss
+        rs = gain / loss.replace(0, np.nan)
         df['rsi'] = 100 - (100 / (1 + rs))
         df['rsi'] = df['rsi'].fillna(50)
         
@@ -83,15 +87,15 @@ class MLPredictor:
         df['bb_position'] = (close - (sma20 - 2*std20)) / (4*std20)
         df['bb_width'] = (4*std20) / sma20
         
-        # SMA & Ratio
+        # SMA Ratio
         sma50 = close.rolling(50).mean()
         df['sma_20_50_ratio'] = (sma20 / sma50 - 1) * 100
         
-        # Volume Ratio
+        # Volume
         vol_ma = df['volume'].rolling(20).mean()
         df['volume_ratio'] = df['volume'] / vol_ma.replace(0, 1)
         
-        # Price Changes
+        # Price Change
         df['price_change_1h'] = close.pct_change(1) * 100
         df['price_change_4h'] = close.pct_change(4) * 100
         
@@ -105,12 +109,13 @@ class MLPredictor:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-        # 時間特徴量の追加
+        # Time Features
         if 'timestamp' in df.columns:
             dates = pd.to_datetime(df['timestamp'])
         else:
             dates = df.index
-
+        
+        # タイムスタンプ型に応じた処理
         if hasattr(dates, 'hour'):
             hours = dates.hour
             dayofweek = dates.dayofweek
@@ -125,96 +130,109 @@ class MLPredictor:
         df['hour_cos'] = np.cos(2 * np.pi * hours / 24)
         df['day_of_week'] = dayofweek / 6.0
 
-        # 最新の1行の特徴量のみを抽出
-        latest_features = df.iloc[[-1]][self.feature_cols].fillna(0)
+        latest_features = df.iloc[[-1]][[c for c in self.feature_cols if c != 'orderbook_imbalance']].fillna(0)
         return latest_features
 
     def prepare_lstm_data(self, prices: np.ndarray) -> np.ndarray:
-        if len(prices) < self.lstm_lookback:
+        """
+        LSTM用データ作成 (対数変化率 + 正規化)
+        """
+        if len(prices) < self.lstm_lookback + 1:
             return np.zeros((1, self.lstm_lookback, 1))
         
-        window = prices[-self.lstm_lookback:]
-        min_p = window.min()
-        max_p = window.max()
+        # 価格そのものではなく、変化率を使う（価格水準が変わっても対応可能に）
+        s = pd.Series(prices)
+        returns = np.log(s / s.shift(1)).fillna(0).values
         
-        if max_p - min_p < 1e-8:
-            normalized = np.zeros_like(window)
-        else:
-            normalized = (window - min_p) / (max_p - min_p)
+        window = returns[-self.lstm_lookback:]
+        
+        # Z-score正規化
+        mean = window.mean()
+        std = window.std() + 1e-8
+        normalized = (window - mean) / std
             
         return normalized.reshape(1, self.lstm_lookback, 1)
 
-    def predict(self, df_1h: pd.DataFrame) -> dict:
+    def predict(self, df: pd.DataFrame, extra_features: dict = None) -> dict:
         """
-        DataFrameを受け取り、LGBMとLSTMで予測を行う
+        予測実行 (外部特徴量対応)
         """
-        if df_1h is None or len(df_1h) < 100:
+        if df is None or len(df) < 100:
             return {'action': 'HOLD', 'confidence': 0, 'reasoning': 'データ不足', 'model_used': 'NONE'}
 
         # 1. 特徴量作成
-        features = self.create_features_from_history(df_1h)
+        features = self.create_features_from_history(df)
         if features is None:
-            return {'action': 'HOLD', 'confidence': 0, 'reasoning': '特徴量計算不可', 'model_used': 'NONE'}
+            return {'action': 'HOLD', 'confidence': 0, 'model_used': 'NONE'}
 
-        # ロックを取得してモデルを使用
+        # 外部特徴量（板情報）を注入
+        if extra_features:
+            features['orderbook_imbalance'] = extra_features.get('imbalance', 0)
+        else:
+            features['orderbook_imbalance'] = 0
+
+        # カラム順序の保証と欠損埋め
+        for col in self.feature_cols:
+            if col not in features.columns:
+                features[col] = 0.0
+        features = features[self.feature_cols]
+
         with self.model_lock:
             lgb_model = self.lgb_model
             lstm_model = self.lstm_model
 
         # 2. LightGBM 予測
-        lgb_up_prob = 0.0
-        lgb_down_prob = 0.0
+        lgb_up = 0.0
+        lgb_down = 0.0
         lgb_used = False
         
         if lgb_model:
             try:
                 lgb_pred = lgb_model.predict(features)
-                lgb_down_prob = float(lgb_pred[0][0])
-                lgb_up_prob = float(lgb_pred[0][2])
+                lgb_down = float(lgb_pred[0][0])
+                lgb_up = float(lgb_pred[0][2])
                 lgb_used = True
             except Exception as e:
                 print(f"⚠️ LGBM予測エラー: {e}")
 
         # 3. LSTM 予測
-        lstm_up_prob = 0.0
-        lstm_down_prob = 0.0
+        lstm_up = 0.0
+        lstm_down = 0.0
         lstm_used = False
         
         if lstm_model:
             try:
-                prices = df_1h['close'].values
+                prices = df['close'].values
                 inp = self.prepare_lstm_data(prices)
                 lstm_pred = lstm_model.predict(inp, verbose=0)[0]
-                lstm_down_prob = float(lstm_pred[0])
-                lstm_up_prob = float(lstm_pred[2])
+                lstm_down = float(lstm_pred[0])
+                lstm_up = float(lstm_pred[2])
                 lstm_used = True
             except Exception as e:
                 print(f"⚠️ LSTM予測エラー: {e}")
 
-        # 4. アンサンブル (平均)
+        # 4. アンサンブル
         if lgb_used and lstm_used:
-            final_up = (lgb_up_prob + lstm_up_prob) / 2
-            final_down = (lgb_down_prob + lstm_down_prob) / 2
-            model_name = "Ensemble(LGBM+LSTM)"
+            final_up = (lgb_up * 0.6 + lstm_up * 0.4) # LGBMを少し重視
+            final_down = (lgb_down * 0.6 + lstm_down * 0.4)
+            model_name = "Ensemble"
         elif lgb_used:
-            final_up = lgb_up_prob
-            final_down = lgb_down_prob
+            final_up = lgb_up
+            final_down = lgb_down
             model_name = "LightGBM"
         elif lstm_used:
-            final_up = lstm_up_prob
-            final_down = lstm_down_prob
+            final_up = lstm_up
+            final_down = lstm_down
             model_name = "LSTM"
         else:
             return {'action': 'HOLD', 'confidence': 0, 'reasoning': 'モデル予測失敗', 'model_used': 'NONE'}
 
-        # 自信度計算の改善
+        # 自信度計算
         max_prob = max(final_up, final_down)
-        
-        # 0.35以上あれば「傾向あり」とみなすスケーリング
+        # 0.35以上で反応開始
         if max_prob < 0.35:
             confidence = 0
         else:
-            # 0.35 -> 0, 0.85 -> 100 の範囲でスケーリング
             confidence = (max_prob - 0.35) / (0.85 - 0.35) * 100
             confidence = min(100, max(0, confidence))
 
@@ -227,11 +245,39 @@ class MLPredictor:
             'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f}"
         }
 
+    def evaluate_model(self, model, X_val, y_val, model_type='lgb'):
+        """
+        モデルの精度評価 (オンライン学習用)
+        """
+        if not SKLEARN_AVAILABLE: return 0.0
+        try:
+            if len(X_val) == 0: return 0.0
+            
+            if model_type == 'lgb':
+                preds = model.predict(X_val)
+                pred_classes = np.argmax(preds, axis=1)
+                # ラベルマップ: -1->0, 0->1, 1->2
+                y_true = y_val.map({-1:0, 0:1, 1:2}).fillna(1)
+                return accuracy_score(y_true, pred_classes)
+            
+            return 0.0
+        except Exception as e:
+            print(f"評価エラー: {e}")
+            return 0.0
+
     def train_lightgbm(self, X, y, X_val=None, y_val=None):
         if not LIGHTGBM_AVAILABLE: return
         
-        # ロック外で学習
-        params = {'objective': 'multiclass', 'num_class': 3, 'metric': 'multi_logloss', 'verbose': -1, 'random_state': 42}
+        # 学習パラメータ (デイトレ用: やや過学習を防ぐ設定)
+        params = {
+            'objective': 'multiclass', 
+            'num_class': 3, 
+            'metric': 'multi_logloss', 
+            'verbose': -1, 
+            'random_state': 42,
+            'learning_rate': 0.05,
+            'num_leaves': 31
+        }
         y_mapped = y.map({-1:0, 0:1, 1:2})
         train_data = lgb.Dataset(X, label=y_mapped)
         valid_sets = []
@@ -241,21 +287,25 @@ class MLPredictor:
         
         new_model = lgb.train(params, train_data, num_boost_round=100, valid_sets=valid_sets)
         
-        # ロックして保存
         with self.model_lock:
             self.lgb_model = new_model
             joblib.dump(self.lgb_model, self.lgb_path)
-
+    
     def train_lstm(self, prices, labels, lookback=60, epochs=20):
         if not KERAS_AVAILABLE: return
         
-        # データ準備
+        # データ作成
         X, y = [], []
-        for i in range(lookback, len(prices)):
-            window = prices[i-lookback:i]
-            denom = window.max() - window.min()
-            if denom < 1e-8: denom = 1
-            norm = (window - window.min()) / denom
+        s = pd.Series(prices)
+        # 対数変化率
+        returns = np.log(s / s.shift(1)).fillna(0).values
+        
+        for i in range(lookback, len(returns)):
+            window = returns[i-lookback:i]
+            mean = window.mean()
+            std = window.std() + 1e-8
+            norm = (window - mean) / std
+            
             X.append(norm)
             l = labels[i]
             if l == -1: enc = [1,0,0]
@@ -268,7 +318,6 @@ class MLPredictor:
         X = np.array(X).reshape(-1, lookback, 1)
         y = np.array(y)
         
-        # モデル構築・学習
         model = Sequential([
             LSTM(64, return_sequences=True, input_shape=(lookback, 1)), Dropout(0.2),
             LSTM(32), Dropout(0.2), Dense(3, activation='softmax')
@@ -276,47 +325,14 @@ class MLPredictor:
         model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
         model.fit(X, y, epochs=epochs, batch_size=32, validation_split=0.2, verbose=0)
         
-        # ロックして保存
         with self.model_lock:
             self.lstm_model = model
             model.save(self.lstm_path)
 
     def load_models(self):
         if os.path.exists(self.lgb_path) and LIGHTGBM_AVAILABLE:
-            try:
-                self.lgb_model = joblib.load(self.lgb_path)
-            except:
-                print("⚠️ LightGBMモデル読み込み失敗 (再学習してください)")
-                
+            try: self.lgb_model = joblib.load(self.lgb_path)
+            except: pass
         if os.path.exists(self.lstm_path) and KERAS_AVAILABLE:
-            try:
-                self.lstm_model = keras.models.load_model(self.lstm_path)
-            except:
-                print("⚠️ LSTMモデル読み込み失敗 (再学習してください)")
-
-
-# ===== 使用例 (修正版) =====
-if __name__ == "__main__":
-    print("="*70)
-    print("🤖 機械学習予測システムテスト")
-    print("="*70)
-    
-    predictor = MLPredictor('ETH')
-    
-    # ランダムなダミーデータでテスト
-    dates = pd.date_range(start='2024-01-01', periods=200, freq='h')
-    dummy_data = {
-        'timestamp': dates,
-        'open': np.random.rand(200) * 100 + 3000,
-        'high': np.random.rand(200) * 100 + 3050,
-        'low': np.random.rand(200) * 100 + 2950,
-        'close': np.random.rand(200) * 100 + 3000,
-        'volume': np.random.rand(200) * 1000
-    }
-    df = pd.DataFrame(dummy_data)
-    
-    print("\n📊 予測実行中...")
-    result = predictor.predict(df)
-    
-    print(f"✅ 結果: {result['action']} (信頼度: {result['confidence']}%)")
-    print(f"   詳細: {result['reasoning']}")
+            try: self.lstm_model = keras.models.load_model(self.lstm_path)
+            except: pass

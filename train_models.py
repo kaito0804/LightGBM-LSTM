@@ -12,9 +12,10 @@ class ModelTrainer:
         print("🚀 モデル学習開始 (時系列分割)")
         
         # 1. 最新データの特定
-        files = glob.glob(f"training_data/{self.symbol}_1h_training*.csv")
+        files = glob.glob(f"training_data/{self.symbol}_15m_training*.csv")
         if not files:
             print("❌ エラー: 学習データが見つかりません。")
+            # メッセージも修正しておくと親切です
             print("   先に 'python data_collector.py' を実行してデータを収集してください。")
             return
         

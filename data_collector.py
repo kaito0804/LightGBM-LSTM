@@ -10,6 +10,7 @@ class DataCollector:
     修正版: 3値分類（上昇/下降/中立）データ収集
     - Pandasベクトル演算により高速に学習データを生成
     - ATRベースの動的ラベル付けを実装
+    - 板情報カラムの初期化を追加
     """
     
     def __init__(self, symbol='ETH', data_dir='training_data'):
@@ -18,7 +19,7 @@ class DataCollector:
         os.makedirs(data_dir, exist_ok=True)
         self.market = AdvancedMarketData(symbol)
         
-        # デイトレ用にホライゾンを短縮 (1時間後の予測)
+        # デイトレ用にホライゾンを短縮 (1本先の予測)
         self.prediction_horizon = 1 
         # 変動率閾値のベース (ATRがない場合のフォールバック)
         self.neutral_threshold = 0.3 
@@ -46,8 +47,7 @@ class DataCollector:
     
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        テクニカル指標と時間特徴量の追加 (全行一括計算)
-        個別の計算メソッドを廃止し、ここでPandasベクトル演算を行うことで高速化
+        テクニカル指標と時間特徴量の追加
         """
         df = df.copy()
         close = df['close']
@@ -59,11 +59,10 @@ class DataCollector:
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-        # ゼロ除算回避
         loss = loss.replace(0, np.nan)
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
-        df['rsi'] = df['rsi'].fillna(50) # NaN埋め
+        df['rsi'] = df['rsi'].fillna(50)
         
         # --- 2. MACD (12, 26, 9) ---
         ema12 = close.ewm(span=12, adjust=False).mean()
@@ -108,16 +107,19 @@ class DataCollector:
             df['hour_cos'] = np.cos(2 * np.pi * dates.dt.hour / 24)
             df['day_of_week'] = dates.dt.dayofweek / 6.0
         else:
-            # フォールバック
             df['hour_sin'] = 0
             df['hour_cos'] = 0
             df['day_of_week'] = 0
+
+        # --- 10. 板情報 (重要: 過去データはないため0埋めする) ---
+        # これにより feature_cols との整合性が保たれます
+        df['orderbook_imbalance'] = 0.0
 
         return df
 
     def create_labels(self, df: pd.DataFrame, horizon: int) -> pd.DataFrame:
         """
-        ATRに基づいた動的閾値によるラベル付け (デイトレード最適化版)
+        ATRに基づいた動的閾値によるラベル付け
         """
         future_price = df['close'].shift(-horizon)
         current_price = df['close']
@@ -125,15 +127,12 @@ class DataCollector:
         pct_change = ((future_price - current_price) / current_price) * 100
         df['future_change'] = pct_change
         
-        # ATRベースの動的閾値
         if 'atr' in df.columns:
             atr_pct = (df['atr'] / df['close']) * 100
-            # 係数 0.35 (中立50%前後を狙う設定)
             dynamic_threshold = (atr_pct * 0.35).clip(0.1, 1.5)
         else:
             dynamic_threshold = pd.Series(self.neutral_threshold, index=df.index)
 
-        # 3値分類ロジック
         conditions = [
             (pct_change > dynamic_threshold),
             (pct_change < -dynamic_threshold)
@@ -152,23 +151,21 @@ class DataCollector:
         df.to_csv(filepath, index=False)
         print(f"💾 データ保存完了: {filepath} ({len(df)}行)")
         
-        # 分布確認
         counts = df['label'].value_counts().sort_index()
         dist = counts.to_dict()
         print(f"   分布: {dist}")
         return filepath
     
     def collect_multiple_timeframes(self):
-        # デイトレなら1h足がメイン
-        filename = f"{self.symbol}_1h_training.csv"
+        # デイトレ用 15分足
+        filename = f"{self.symbol}_15m_training.csv"
         
-        # ✅ 安全な呼び出し: データがNoneなら保存しない
-        df_1h = self.collect_historical_data('1h', 3000)
-        if df_1h is not None:
-            path = self.save_dataset(df_1h, filename=filename)
-            return {'1h': path}
+        df_15m = self.collect_historical_data('15m', 3000)
+        if df_15m is not None:
+            path = self.save_dataset(df_15m, filename=filename)
+            return {'15m': path}
         else:
-            print("❌ 1hデータの取得に失敗しました")
+            print("❌ 15mデータの取得に失敗しました")
             return {}
 
 if __name__ == "__main__":
