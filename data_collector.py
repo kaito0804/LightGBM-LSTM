@@ -111,10 +111,6 @@ class DataCollector:
             df['hour_cos'] = 0
             df['day_of_week'] = 0
 
-        # --- 10. 板情報 (重要: 過去データはないため0埋めする) ---
-        # これにより feature_cols との整合性が保たれます
-        df['orderbook_imbalance'] = 0.0
-
         return df
 
     def create_labels(self, df: pd.DataFrame, horizon: int) -> pd.DataFrame:

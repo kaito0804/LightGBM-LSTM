@@ -78,7 +78,7 @@ class GoogleSheetsLogger:
         
         sheets_config = [
             ("実行履歴", ["日時", "アクション", "方向", "数量(ETH)", "価格($)", "手数料($)", "実現損益($)", "残高($)", "理由"]),
-            ("AI分析", ["日時", "現在価格", "AI判断", "信頼度(%)", "上昇確率(%)", "下降確率(%)", "市場レジーム", "使用モデル", "RSI", "Volatility"]),
+            ("AI分析", ["日時", "現在価格", "AI判断", "信頼度(%)", "上昇確率(%)", "下降確率(%)", "市場レジーム", "使用モデル", "RSI", "Volatility", "前回比($)", "予測判定"]),
             ("資産推移", ["日時", "総資産($)", "利用可能($)", "ポジション価値($)", "未実現損益($)", "累積実現損益($)"])
         ]
 
@@ -135,7 +135,9 @@ class GoogleSheetsLogger:
             data.get('market_regime', 'UNKNOWN'),
             data.get('model_used', 'ENSEMBLE'),
             f"{data.get('rsi', 0):.1f}",
-            f"{data.get('volatility', 0):.2f}"
+            f"{data.get('volatility', 0):.2f}",
+            data.get('price_diff', '-'),
+            data.get('prediction_result', '-')
         ]
         self.buffer['ai_analysis'].append(row)
         self._try_flush()

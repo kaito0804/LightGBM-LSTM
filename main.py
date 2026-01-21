@@ -81,7 +81,7 @@ class TradingBot:
             imbalance = structure_data.get('orderbook_imbalance', 0)
             
             # === ステップ2: ML予測実行 (板情報を注入) ===
-            ml_result = self.ml_predictor.predict(df_main, extra_features={'imbalance': imbalance})
+            ml_result = self.ml_predictor.predict(df_main)
             
             # モデル未学習時のガード
             if ml_result.get('model_used') == 'NONE':
@@ -464,6 +464,13 @@ class TradingBot:
         try:
             last_ai_check_time = 0
             fast_interval = 10 
+
+            last_ai_state = {
+                'price': None,
+                'up_prob': 0,
+                'down_prob': 0,
+                'action': 'HOLD'
+            }
             
             while self.running:
                 current_time = time.time()
@@ -519,6 +526,48 @@ class TradingBot:
                         if decision:
                             action = decision.get('action', 'HOLD')
                             confidence = decision.get('confidence', 0)
+                            up_prob = decision['ml_probabilities']['up']
+                            down_prob = decision['ml_probabilities']['down']
+                            price_diff_str = "-"
+                            pred_result = "-"
+
+                            if last_ai_state['price'] is not None:
+                                # 価格変動の計算
+                                diff = current_price - last_ai_state['price']
+                                sign = "+" if diff > 0 else ""
+                                price_diff_str = f"{sign}{diff:.2f}"
+                                
+                                # 前回のAI予測はどうだったか？
+                                prev_up = last_ai_state['up_prob']
+                                prev_down = last_ai_state['down_prob']
+                                prev_action = last_ai_state['action']
+                                
+                                # 判定ロジック
+                                is_price_up = (diff > 0.5)   # 0.5ドル以上の動きを反応とする
+                                is_price_down = (diff < -0.5)
+                                
+                                if prev_action in ['BUY', 'SELL'] or (prev_up > 0.45 or prev_down > 0.45):
+                                    # AIが方向性を持っていた場合
+                                    if (prev_up > prev_down and is_price_up) or (prev_down > prev_up and is_price_down):
+                                        pred_result = "✅ 正解"
+                                    elif (prev_up > prev_down and is_price_down) or (prev_down > prev_up and is_price_up):
+                                        pred_result = "❌ 不正解"
+                                    else:
+                                        pred_result = "➖ 微動"
+                                else:
+                                    # AIが様子見(HOLD)だった場合
+                                    if abs(diff) > 5.0: # 大きく動いたのに見送った場合
+                                        pred_result = "⚠️ 機会損失" 
+                                    else:
+                                        pred_result = "⚪️ レンジ的中" # 動かなかったので見送り正解
+
+                            # 状態の更新
+                            last_ai_state = {
+                                'price': current_price,
+                                'up_prob': up_prob,
+                                'down_prob': down_prob,
+                                'action': action
+                            }
                             
                             # 4. AI思考ログの作成
                             signal_log = {
@@ -531,7 +580,9 @@ class TradingBot:
                                 'volatility': volatility,
                                 'rsi': analysis.get('indicators', {}).get('rsi', 0),
                                 'market_regime': decision.get('market_regime'),
-                                'model_used': decision.get('reasoning', '').split('|')[-1].strip()
+                                'model_used': decision.get('reasoning', '').split('|')[-1].strip(),
+                                'price_diff': price_diff_str,
+                                'prediction_result': pred_result
                             }
 
                             # 5. 取引実行 または ログ記録のみ

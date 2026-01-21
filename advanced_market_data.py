@@ -35,7 +35,7 @@ class AdvancedMarketData:
     VALID_INTERVALS = {'1m', '5m', '15m', '1h', '4h', '1d'}
 
     def __init__(self, symbol='ETH'):
-        # ✅ 修正: シンボル名を正規化 (より堅牢に)
+        # ✅ シンボル名を正規化 (より堅牢に)
         self.symbol = symbol.replace('-USD', '').replace('/USD', '').upper()
 
         # 改善版スコアリングシステムの初期化
@@ -45,10 +45,7 @@ class AdvancedMarketData:
         self.network = os.getenv("NETWORK", "testnet").lower()
         
         # Hyperliquid API設定
-        if self.network == "mainnet":
-            self.api_base = os.getenv("HYPERLIQUID_MAINNET_URL", "https://api.hyperliquid.xyz")
-        else:
-            self.api_base = os.getenv("HYPERLIQUID_TESTNET_URL", "https://api.hyperliquid-testnet.xyz")
+        self.api_base = "https://api.hyperliquid.xyz"
         
         self.info_url = f"{self.api_base}/info"
         
@@ -135,67 +132,22 @@ class AdvancedMarketData:
             df = pd.DataFrame(candles)
             df = df.sort_values('timestamp').reset_index(drop=True)
             
-            if self.network != "mainnet":
-                print(f"✅ {self.symbol} {timeframe}: {len(df)}本取得")
-            
             return df
             
         except Exception as e:
             # エラー処理の一元化
             error_msg = f"OHLCV取得エラー: {str(e)}"
+            print(f"⚠️ {error_msg}")
             
-            if self.network == "mainnet":
-                # Mainnetは絶対に停止させる
-                raise Exception(f"CRITICAL: {error_msg} - Mainnetでは安全のため停止")
-            else:
-                # Testnetはログを出してフォールバック
-                print(f"⚠️ {error_msg} -> フォールバックデータ使用")
-                return self._get_fallback_data(limit)
+            return None
     
 
 
     def _get_fallback_data(self, limit):
-        """
-        フォールバック用のダミーデータ生成
-        ⚠️ Testnet専用 - Mainnetでは使用されない
-        """
-        if self.network == "mainnet":
-            raise Exception("CRITICAL: Mainnetでフォールバックデータは使用できません")
-        
-        print(f"⚠️ フォールバックデータを使用します (Testnetのみ)")
-        
-        base_price = 3000.0 if self.symbol == 'ETH' else 100.0
-        
-        timestamps = []
-        opens = []
-        highs = []
-        lows = []
-        closes = []
-        volumes = []
-        
-        for i in range(limit):
-            price = base_price + np.random.randn() * (base_price * 0.02)
-            high = price + abs(np.random.randn() * (base_price * 0.01))
-            low = price - abs(np.random.randn() * (base_price * 0.01))
-            close = low + (high - low) * np.random.random()
-            
-            timestamps.append(datetime.now() - timedelta(hours=limit-i))
-            opens.append(price)
-            highs.append(high)
-            lows.append(low)
-            closes.append(close)
-            volumes.append(np.random.randint(100, 1000))
-        
-        df = pd.DataFrame({
-            'timestamp': timestamps,
-            'open': opens,
-            'high': highs,
-            'low': lows,
-            'close': closes,
-            'volume': volumes
-        })
-        
-        return df
+        # (省略: このメソッドは使用されません)
+        return None
+
+
     
     def calculate_rsi(self, prices, period=14):
         """
@@ -359,7 +311,7 @@ class AdvancedMarketData:
     def get_comprehensive_analysis(self):
         """
         総合的な市場分析（改善版スコアリング統合）
-        ✅ 修正: 重複計算の排除とロジック整理
+        ✅ 重複計算の排除とロジック整理
         """
         analysis = {
             'symbol': self.symbol,
@@ -520,15 +472,8 @@ class AdvancedMarketData:
             raise ValueError(f"allMids取得失敗: Status {response.status_code}")
 
         except Exception as e:
-            error_msg = f"現在価格取得エラー: {e}"
-            
-            if self.network == "mainnet":
-                # Mainnetはリスク回避のため停止
-                raise Exception(f"CRITICAL: {error_msg} - Mainnetでは取引停止")
-            
-            # Testnetフォールバック (テスト用固定値)
-            print(f"⚠️ {error_msg} -> フォールバック価格使用")
-            return 3000.0 if 'ETH' in self.symbol else 100.0
+            print(f"⚠️ 現在価格取得エラー: {e} -> データ取得失敗")
+            return None
 
 
 

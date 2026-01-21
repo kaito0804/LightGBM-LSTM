@@ -49,8 +49,7 @@ class MLPredictor:
             'rsi', 'macd_hist', 'bb_position', 'bb_width',
             'atr', 'volume_ratio', 'price_change_1h',
             'price_change_4h', 'sma_20_50_ratio', 'volatility',
-            'hour_sin', 'hour_cos', 'day_of_week',
-            'orderbook_imbalance' # 新規追加: 板情報の偏り
+            'hour_sin', 'hour_cos', 'day_of_week'
         ]
         self.lstm_lookback = 60
         self.load_models()
@@ -164,12 +163,6 @@ class MLPredictor:
         features = self.create_features_from_history(df)
         if features is None:
             return {'action': 'HOLD', 'confidence': 0, 'model_used': 'NONE'}
-
-        # 外部特徴量（板情報）を注入
-        if extra_features:
-            features['orderbook_imbalance'] = extra_features.get('imbalance', 0)
-        else:
-            features['orderbook_imbalance'] = 0
 
         # カラム順序の保証と欠損埋め
         for col in self.feature_cols:
@@ -332,7 +325,8 @@ class MLPredictor:
     def load_models(self):
         if os.path.exists(self.lgb_path) and LIGHTGBM_AVAILABLE:
             try: self.lgb_model = joblib.load(self.lgb_path)
-            except: pass
+            except Exception as e: print(f"⚠️ LGBM読み込みエラー: {e}")
+
         if os.path.exists(self.lstm_path) and KERAS_AVAILABLE:
             try: self.lstm_model = keras.models.load_model(self.lstm_path)
-            except: pass
+            except Exception as e: print(f"⚠️ LSTM読み込みエラー: {e}")
