@@ -76,6 +76,9 @@ class TradingBot:
         self.ws_monitor = OrderBookMonitor(symbol=symbol)
         self.ws_monitor.start() # ここでスパイが出動
         time.sleep(2) # 接続待ち
+
+        # OI（建玉）の変化を追跡するための変数
+        self.last_oi = 0.0
         
         print("\n" + "="*70)
         print(f"🚀 Hyperliquid {self.bot_name} Bot (DayTrade Logic)")
@@ -95,6 +98,9 @@ class TradingBot:
             # 板情報の偏りを取得 (プラスなら買い圧、マイナスなら売り圧)
             fast_imbalance = self.ws_monitor.get_latest_imbalance()
             print(f"⚡ 高速板情報: {fast_imbalance:.2f}")
+
+            # OI変化率を取り出す
+            oi_delta = structure_data.get('oi_delta_pct', 0.0)
             
             # === ステップ2: ML予測実行 ===
             ml_result = self.ml_predictor.predict(df_main)
@@ -133,8 +139,7 @@ class TradingBot:
             sma_50 = indicators.get('sma_50', current_price)
 
             
-            # === ★復活: 板情報による補正 (Fast Imbalance Boost) ===
-            # WebSocketによりリアルタイム性が確保されたため、ロジックを再有効化
+            # 1. 板情報による補正 (Fast Imbalance Boost) ===
             adjusted_up_prob = up_prob
             adjusted_down_prob = down_prob
 
@@ -147,6 +152,23 @@ class TradingBot:
             elif fast_imbalance < -0.3: # 売り板が強い
                 adjusted_down_prob += BOOST_VAL 
                 reasoning += f" [板:売り有利({fast_imbalance:.2f})]"
+
+            # 2. OIフィルター & ブースト
+            # OIが減少している(ショートカバー等の手仕舞い)場合、トレンドフォローの確率を下げる（ダマシ回避）
+            if oi_delta < -0.05: # -0.05%以上減少（15秒間でこれは大きな動き）
+                adjusted_up_prob -= 0.05
+                adjusted_down_prob -= 0.05
+                reasoning += f" [OI減:手仕舞い警戒]"
+            
+            # OIが急増している（本気の資金流入）場合、方向感を後押し
+            elif oi_delta > 0.05:
+                # どちらかの確率が既に高いなら、それをさらに後押し
+                if adjusted_up_prob > adjusted_down_prob:
+                    adjusted_up_prob += 0.03
+                    reasoning += f" [OI増:追随]"
+                elif adjusted_down_prob > adjusted_up_prob:
+                    adjusted_down_prob += 0.03
+                    reasoning += f" [OI増:追随]"
 
             # 補正後の自信度を再計算
             adjusted_confidence = max(adjusted_up_prob, adjusted_down_prob) * 100
@@ -629,10 +651,25 @@ class TradingBot:
                     # 2. 板情報 (Structure) の取得
                     structure = self.market_data.get_market_structure_features()
                     fast_imbalance = self.ws_monitor.get_latest_imbalance()
+
+                    # 3. OIの取得と変化率計算
+                    # WebSocket経由で高速・確実にOIを取得
+                    current_oi = self.ws_monitor.get_latest_oi()
+                    if current_oi == 0:
+                        current_oi = self.market_data.get_open_interest()
+
+                    oi_delta_pct = 0.0
+                    if self.last_oi > 0:
+                        oi_delta_pct = ((current_oi - self.last_oi) / self.last_oi) * 100
+                    
+                    # 変化がない(0.0)場合は、取得失敗等の可能性もあるため更新しない手もありだが、
+                    # ここでは常に最新を正とする
+                    if current_oi > 0:
+                        self.last_oi = current_oi
                     
                     if analysis:
                         volatility = analysis.get('volatility', 0)
-                        print(f"   Vol: {volatility:.2f}% | Fast Imbalance: {fast_imbalance:.2f}")
+                        print(f"   Vol: {volatility:.2f}% | Imb: {fast_imbalance:.2f} | OI: {current_oi:.2f} | OI Δ: {oi_delta_pct:+.4f}%")
 
                         # 設定した閾値（.envのLOW_VOLATILITY_THRESHOLD、デフォルト1.5）未満ならスキップ
                         # ここでは安全のためハードコード気味に 1.0% 未満は絶対停止とする例
@@ -645,6 +682,7 @@ class TradingBot:
                             continue
                         
                         # 3. ML判断を実行
+                        structure['oi_delta_pct'] = oi_delta_pct
                         decision = self.get_ml_decision(analysis, account_state, structure)
                         
                         if decision:

@@ -7,23 +7,9 @@ import pandas as pd
 import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-
 load_dotenv()
-
 from improved_signal_scoring import ImprovedSignalScoring
 
-class AdvancedMarketData:
-    """
-    高度な市場データ分析クラス（Mainnet対応版）
-    - Hyperliquid APIから実際のローソク足データを取得
-    - Mainnetではフォールバックデータを使用せず、エラーで停止
-    - マルチタイムフレーム分析
-    - テクニカル指標計算
-    """
-    
-    import os
-import requests
-# 他のインポートはそのまま
 
 class AdvancedMarketData:
     """
@@ -539,6 +525,57 @@ class AdvancedMarketData:
             print(f"⚠️ 市場構造データ取得エラー: {e}")
             
         return features
+
+
+    
+    def get_open_interest(self):
+        """
+        【診断モード】現在の未決済建玉(OI)を取得
+        """
+        try:
+            payload = {"type": "metaAndAssetCtxs"}
+            response = requests.post(self.info_url, json=payload, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    state = data[0]
+                    universe = state.get('universe', [])
+                    asset_ctxs = state.get('assetCtxs', [])
+                    
+                    # 診断ログ: データ件数を表示
+                    # print(f"DEBUG: Universe len={len(universe)}, AssetCtxs len={len(asset_ctxs)}")
+                    
+                    # シンボル検索
+                    found_index = -1
+                    for i, asset in enumerate(universe):
+                        if asset['name'] == self.symbol:
+                            found_index = i
+                            break
+                    
+                    if found_index != -1:
+                        # シンボルは見つかった
+                        if found_index < len(asset_ctxs):
+                            ctx = asset_ctxs[found_index]
+                            oi = float(ctx.get('openInterest', 0))
+                            # print(f"DEBUG: Symbol {self.symbol} found at {found_index}. OI={oi}")
+                            return oi
+                        else:
+                            # ここが原因かチェック
+                            print(f"⚠️ OI診断エラー: インデックス超過 (Symbol: {self.symbol}, Index: {found_index}, CtxLen: {len(asset_ctxs)})")
+                            return 0.0
+                    else:
+                        # シンボルが見つからない
+                        print(f"⚠️ OI診断エラー: シンボルが見つかりません (Target: {self.symbol})")
+                        # 念のため似た名前がないか探す
+                        # similar = [a['name'] for a in universe if 'ETH' in a['name']]
+                        # print(f"   (参考) 'ETH'を含む銘柄: {similar}")
+                        return 0.0
+
+            return 0.0
+        except Exception as e:
+            print(f"⚠️ OI取得例外エラー: {e}")
+            return 0.0
 
 
 if __name__ == "__main__":
