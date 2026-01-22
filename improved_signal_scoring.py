@@ -240,6 +240,13 @@ class ImprovedSignalScoring:
         if volatility > self.high_vol_threshold: regime = 'VOLATILE'
         elif trend_strength > 2.0:               regime = 'TRENDING'
         else:                                    regime = 'RANGING'
+
+        # 変動が少なすぎる場合は、ノイズでの損失を防ぐために強制的に「待機」とする
+        if volatility < self.low_vol_threshold:
+            final_score = 50       # 強制中立
+            direction = 'NEUTRAL'
+            confidence = 0         # 自信なし
+            regime = 'LOW_VOLATILITY'
         
         return {
             'signal_strength': int(final_score),

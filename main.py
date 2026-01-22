@@ -13,6 +13,7 @@ from risk_manager import RiskManager
 from google_sheets_logger import GoogleSheetsLogger
 from ml_predictor import MLPredictor
 from online_learning import OnlineLearner
+from ws_monitor import OrderBookMonitor
 
 load_dotenv()
 
@@ -70,6 +71,11 @@ class TradingBot:
             except Exception as e:
                 print(f"⚠️ Google Sheetsログ記録を無効化: {e}")
                 self.enable_sheets_logging = False
+
+        # 監視システムの起動
+        self.ws_monitor = OrderBookMonitor(symbol=symbol)
+        self.ws_monitor.start() # ここでスパイが出動
+        time.sleep(2) # 接続待ち
         
         print("\n" + "="*70)
         print(f"🚀 Hyperliquid {self.bot_name} Bot (DayTrade Logic)")
@@ -87,7 +93,8 @@ class TradingBot:
             df_main = self.market_data.get_ohlcv(MAIN_TIMEFRAME, limit=200)
             
             # 板情報の偏りを取得 (プラスなら買い圧、マイナスなら売り圧)
-            imbalance = structure_data.get('orderbook_imbalance', 0)
+            fast_imbalance = self.ws_monitor.get_latest_imbalance()
+            print(f"⚡ 高速板情報: {fast_imbalance:.2f}")
             
             # === ステップ2: ML予測実行 ===
             ml_result = self.ml_predictor.predict(df_main)
@@ -125,20 +132,21 @@ class TradingBot:
             current_price = market_analysis.get('price', 0)
             sma_50 = indicators.get('sma_50', current_price)
 
-            # === ★重要: 板情報による補正 (Imbalance Boost) ===
-            # 板が強ければ、AIの確率判定を「甘く」する
-            # imbalance > 0.3 (買い板厚い) -> 上昇確率を +5% 評価
-            # imbalance < -0.3 (売り板厚い) -> 下落確率を +5% 評価
             
+            # === ★復活: 板情報による補正 (Fast Imbalance Boost) ===
+            # WebSocketによりリアルタイム性が確保されたため、ロジックを再有効化
             adjusted_up_prob = up_prob
             adjusted_down_prob = down_prob
-            
-            if imbalance > 0.2: # 買い板がやや厚い
-                adjusted_up_prob += 0.03 # 3%下駄を履かせる
-                reasoning += " [板:買い有利]"
-            elif imbalance < -0.2: # 売り板がやや厚い
-                adjusted_down_prob += 0.03 # 3%下駄を履かせる
-                reasoning += " [板:売り有利]"
+
+            # 閾値設定: 0.3 (全体の30%以上の偏り) があればAIを後押しする
+            BOOST_VAL = 0.05 # 5%の確率加算
+
+            if fast_imbalance > 0.3: # 買い板が強い
+                adjusted_up_prob += BOOST_VAL 
+                reasoning += f" [板:買い有利({fast_imbalance:.2f})]"
+            elif fast_imbalance < -0.3: # 売り板が強い
+                adjusted_down_prob += BOOST_VAL 
+                reasoning += f" [板:売り有利({fast_imbalance:.2f})]"
 
             # 補正後の自信度を再計算
             adjusted_confidence = max(adjusted_up_prob, adjusted_down_prob) * 100
@@ -162,9 +170,8 @@ class TradingBot:
                 # === 新規エントリーロジック (ハイブリッド判定) ===
                 
                 # --- 買い判定 ---
-                # 条件: (補正後確率 > 閾値) AND (RSI < 70) AND (価格 > SMA または 板が強い)
-                # ※「価格 < SMA」でも「板が超強い(0.4以上)」なら逆張りOKとする
-                is_trend_ok_buy = (current_price > sma_50) or (imbalance > 0.4)
+                # 板情報(imbalance)による逆張り許可を削除。SMA50のトレンドフィルターを厳格化。
+                is_trend_ok_buy = (current_price > sma_50)
                 
                 if (adjusted_up_prob >= BASE_THRESHOLD and 
                     adjusted_up_prob > adjusted_down_prob and 
@@ -176,7 +183,7 @@ class TradingBot:
                     reasoning = f'BUY: 予測{adjusted_up_prob*100:.1f}%'
                 
                     # --- 売り判定 ---
-                    is_trend_ok_sell = (current_price < sma_50) or (imbalance < -0.4)
+                    is_trend_ok_sell = (current_price < sma_50)
                 
                 elif (adjusted_down_prob >= BASE_THRESHOLD and 
                       adjusted_down_prob > adjusted_up_prob and 
@@ -208,7 +215,7 @@ class TradingBot:
             print(f"   Model: {ml_result['model_used']}")
             print(f"   Raw Prob: Up {up_prob*100:.1f}% | Down {down_prob*100:.1f}%")
             print(f"   Adj Prob: Up {adjusted_up_prob*100:.1f}% | Down {adjusted_down_prob*100:.1f}%")
-            print(f"   Board Imbalance: {imbalance:.2f}")
+            print(f"   Fast Imbalance: {fast_imbalance:.2f}")
             print(f"   Action: {action} (Conf: {adjusted_confidence:.1f})")
 
             return {
@@ -570,7 +577,7 @@ class TradingBot:
         
         try:
             last_ai_check_time = 0
-            fast_interval = 10 
+            fast_interval = 1 
 
             last_ai_state = {
                 'price': None,
@@ -621,13 +628,23 @@ class TradingBot:
                     
                     # 2. 板情報 (Structure) の取得
                     structure = self.market_data.get_market_structure_features()
-                    imbalance = structure.get('orderbook_imbalance', 0)
+                    fast_imbalance = self.ws_monitor.get_latest_imbalance()
                     
                     if analysis:
                         volatility = analysis.get('volatility', 0)
-                        print(f"   Vol: {volatility:.2f}% | Board Imbalance: {imbalance:.2f}")
+                        print(f"   Vol: {volatility:.2f}% | Fast Imbalance: {fast_imbalance:.2f}")
+
+                        # 設定した閾値（.envのLOW_VOLATILITY_THRESHOLD、デフォルト1.5）未満ならスキップ
+                        # ここでは安全のためハードコード気味に 1.0% 未満は絶対停止とする例
+                        MIN_VOLATILITY_LIMIT = 1.0 
                         
-                        # 3. ML判断を実行 (板情報を渡す)
+                        if volatility < MIN_VOLATILITY_LIMIT:
+                            print(f"💤 低ボラティリティのため待機 (Vol: {volatility:.2f}% < {MIN_VOLATILITY_LIMIT}%)")
+                            last_ai_check_time = current_time # 時間は更新して、次のインターバルまで寝る
+                            time.sleep(fast_interval)
+                            continue
+                        
+                        # 3. ML判断を実行
                         decision = self.get_ml_decision(analysis, account_state, structure)
                         
                         if decision:
@@ -812,7 +829,7 @@ def main():
     net_display = "MAINNET" if network == "mainnet" else "TESTNET"
     symbol = os.getenv('TRADING_SYMBOL', 'ETH')
     env_capital = os.getenv('INITIAL_CAPITAL', '1000')
-    interval = int(os.getenv('CHECK_INTERVAL', '60'))
+    interval = int(os.getenv('CHECK_INTERVAL', '15'))
     enable_sheets = os.getenv('ENABLE_SHEETS_LOGGING', 'true').lower() == 'true'
 
     try:
