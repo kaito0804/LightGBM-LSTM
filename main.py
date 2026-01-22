@@ -84,12 +84,12 @@ class TradingBot:
         print(f"🚀 Hyperliquid {self.bot_name} Bot (DayTrade Logic)")
         print("="*70)
 
+
     
     def get_ml_decision(self, market_analysis: dict, account_state: dict, structure_data: dict) -> dict:
         """
-        【修正: デイトレ・高頻度版】
+        【デイトレ・高頻度版】
         - 閾値を下げてエントリー回数を増やす
-        - AIの確信度が低くても、板情報(Imbalance)が強ければエントリーする
         """
         try:
             # === ステップ1: データ取得 (15分足) ===
@@ -138,31 +138,18 @@ class TradingBot:
             current_price = market_analysis.get('price', 0)
             sma_50 = indicators.get('sma_50', current_price)
 
-            
-            # 1. 板情報による補正 (Fast Imbalance Boost) ===
+            # === 1. 板情報による補正 (Imbalance Boost) は廃止 ===
+            # 確率(Prob)そのものは操作せず、後段の「閾値」を動かす方式に変更。
             adjusted_up_prob = up_prob
             adjusted_down_prob = down_prob
 
-            # 閾値設定: 0.3 (全体の30%以上の偏り) があればAIを後押しする
-            BOOST_VAL = 0.05 # 5%の確率加算
-
-            if fast_imbalance > 0.3: # 買い板が強い
-                adjusted_up_prob += BOOST_VAL 
-                reasoning += f" [板:買い有利({fast_imbalance:.2f})]"
-            elif fast_imbalance < -0.3: # 売り板が強い
-                adjusted_down_prob += BOOST_VAL 
-                reasoning += f" [板:売り有利({fast_imbalance:.2f})]"
-
-            # 2. OIフィルター & ブースト
-            # OIが減少している(ショートカバー等の手仕舞い)場合、トレンドフォローの確率を下げる（ダマシ回避）
-            if oi_delta < -0.05: # -0.05%以上減少（15秒間でこれは大きな動き）
+            # === 2. OIフィルター & ブースト ===
+            # OIが減少している(ショートカバー等の手仕舞い)場合
+            if oi_delta < -0.05: 
                 adjusted_up_prob -= 0.05
                 adjusted_down_prob -= 0.05
                 reasoning += f" [OI減:手仕舞い警戒]"
-            
-            # OIが急増している（本気の資金流入）場合、方向感を後押し
             elif oi_delta > 0.05:
-                # どちらかの確率が既に高いなら、それをさらに後押し
                 if adjusted_up_prob > adjusted_down_prob:
                     adjusted_up_prob += 0.03
                     reasoning += f" [OI増:追随]"
@@ -170,7 +157,7 @@ class TradingBot:
                     adjusted_down_prob += 0.03
                     reasoning += f" [OI増:追随]"
 
-            # 補正後の自信度を再計算
+            # 補正後の自信度を再計算 (OIの影響のみ反映)
             adjusted_confidence = max(adjusted_up_prob, adjusted_down_prob) * 100
 
             if existing_side:
@@ -189,32 +176,49 @@ class TradingBot:
                     reasoning = 'TimeExit: 2時間経過'
 
             else:
-                # === 新規エントリーロジック (ハイブリッド判定) ===
+                # === 新規エントリーロジック (動的閾値判定) ===
                 
+                # 基本の合格ライン (53%)
+                BASE_THRESHOLD = 0.53
+                
+                # fast_imbalance (-1.0 ~ 1.0) に係数を掛けて、ハードルを下げる/上げる
+                # 係数 0.2 の意味: 板がMAX(1.0)なら、閾値が 0.2 (20%) も下がる
+                # 例: 板0.5(強)なら 0.1(10%)下がり、必要勝率は 43% で良くなる
+                threshold_adj = fast_imbalance * 0.20
+                
+                # 買いの合格ライン: 板がプラス(買い有利)なら下がる(入りやすい)
+                buy_threshold = BASE_THRESHOLD - threshold_adj
+                
+                # 売りの合格ライン: 板がマイナス(売り有利)なら下がる(入りやすい)
+                # ※ sell_threshold は「売り板が厚い(マイナス)」時に下げたいので、足し算になる
+                #   (例: -0.5 * 0.2 = -0.1 -> 0.53 + (-0.1) = 0.43)
+                sell_threshold = BASE_THRESHOLD + threshold_adj
+
                 # --- 買い判定 ---
-                # 板情報(imbalance)による逆張り許可を削除。SMA50のトレンドフィルターを厳格化。
                 is_trend_ok_buy = (current_price > sma_50)
                 
-                if (adjusted_up_prob >= BASE_THRESHOLD and 
+                # ★比較対象を固定のBASE_THRESHOLDから buy_threshold に変更
+                if (adjusted_up_prob >= buy_threshold and 
                     adjusted_up_prob > adjusted_down_prob and 
                     rsi < 70 and 
                     is_trend_ok_buy):
                     
                     action = 'BUY'
                     side = 'LONG'
-                    reasoning = f'BUY: 予測{adjusted_up_prob*100:.1f}%'
+                    reasoning = f'BUY: 予測{adjusted_up_prob*100:.1f}% > 閾値{buy_threshold*100:.1f}% [板:{fast_imbalance:.2f}]'
                 
                     # --- 売り判定 ---
                     is_trend_ok_sell = (current_price < sma_50)
                 
-                elif (adjusted_down_prob >= BASE_THRESHOLD and 
+                # ★比較対象を sell_threshold に変更
+                elif (adjusted_down_prob >= sell_threshold and 
                       adjusted_down_prob > adjusted_up_prob and 
                       rsi > 30 and 
                       is_trend_ok_sell):
                       
                     action = 'SELL'
                     side = 'SHORT'
-                    reasoning = f'SELL: 予測{adjusted_down_prob*100:.1f}%'
+                    reasoning = f'SELL: 予測{adjusted_down_prob*100:.1f}% > 閾値{sell_threshold*100:.1f}% [板:{fast_imbalance:.2f}]'
             
             # === 動的リスクパラメータ (回転率重視) ===
             volatility = market_analysis.get('volatility', 2.0)
@@ -725,8 +729,8 @@ class TradingBot:
                                 past_up = target_data['up_prob']
                                 past_down = target_data['down_prob']
                                 
-                                # トレード対象になるレベルだったか？ (Conf >= 35)
-                                is_trade_level = (past_conf >= 35)
+                                # トレード対象になるレベルだったか？ 
+                                is_trade_level = (past_conf >= 50)
 
                                 result_label = "⚪️ Draw"
                                 
