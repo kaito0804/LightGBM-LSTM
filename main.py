@@ -19,7 +19,7 @@ load_dotenv()
 # 緊急損切り・利確設定
 EMERGENCY_SL_PCT = float(os.getenv('EMERGENCY_STOP_LOSS', '-2.0')) # デイトレ用にタイトに設定
 SECURE_PROFIT_TP_PCT = float(os.getenv('SECURE_TAKE_PROFIT', '4.0'))
-MIN_SIGNAL_STRENGTH = int(os.getenv('MIN_SIGNAL_STRENGTH', '60'))
+MIN_SIGNAL_STRENGTH = int(os.getenv('MIN_SIGNAL_STRENGTH', '45'))
 
 # 時間軸設定
 MAIN_TIMEFRAME = '15m'  # デイトレードの主軸
@@ -44,6 +44,14 @@ class TradingBot:
         # エントリー時刻管理（時間切れ撤退用）
         self.last_entry_time = None
 
+        # トレードの文脈を保存する変数
+        self.trade_context = {
+            'entry_price': 0.0,
+            'entry_reason': '',
+            'size': 0.0,
+            'side': 'NONE'
+        }
+
         # 機械学習予測器
         self.ml_predictor = MLPredictor(symbol=symbol)
         # 15分足ベースで学習するように設定
@@ -53,6 +61,8 @@ class TradingBot:
         
         # Google Sheetsロガー初期化
         self.sheets_logger = None
+        from collections import deque
+        self.prediction_history = deque() 
         if self.enable_sheets_logging:
             try:
                 self.sheets_logger = GoogleSheetsLogger()
@@ -68,34 +78,29 @@ class TradingBot:
     
     def get_ml_decision(self, market_analysis: dict, account_state: dict, structure_data: dict) -> dict:
         """
-        【修正・最適化版】機械学習ベースの取引判断
-        - 15分足データを使用
-        - 板情報の不均衡(Imbalance)を考慮
-        - 時間経過による撤退ロジックを追加
+        【修正: デイトレ・高頻度版】
+        - 閾値を下げてエントリー回数を増やす
+        - AIの確信度が低くても、板情報(Imbalance)が強ければエントリーする
         """
         try:
             # === ステップ1: データ取得 (15分足) ===
             df_main = self.market_data.get_ohlcv(MAIN_TIMEFRAME, limit=200)
             
-            # 板情報の偏りを取得
+            # 板情報の偏りを取得 (プラスなら買い圧、マイナスなら売り圧)
             imbalance = structure_data.get('orderbook_imbalance', 0)
             
-            # === ステップ2: ML予測実行 (板情報を注入) ===
+            # === ステップ2: ML予測実行 ===
             ml_result = self.ml_predictor.predict(df_main)
             
-            # モデル未学習時のガード
             if ml_result.get('model_used') == 'NONE':
-                return {
-                    'action': 'HOLD', 'side': 'NONE', 'confidence': 0,
-                    'reasoning': ml_result.get('reasoning', 'モデル未学習')
-                }
+                return {'action': 'HOLD', 'side': 'NONE', 'confidence': 0, 'reasoning': 'モデル未学習'}
             
             # === ステップ3: 確率分布の解析 ===
             up_prob = ml_result['up_prob']
             down_prob = ml_result['down_prob']
-            confidence = ml_result['confidence']
+            confidence = ml_result['confidence'] # これは max(up, down) * 100
             
-            # 既存ポジションの特定
+            # 既存ポジション確認
             existing_side = None
             if account_state and 'assetPositions' in account_state:
                 for pos in account_state['assetPositions']:
@@ -104,76 +109,112 @@ class TradingBot:
                         existing_side = 'LONG' if float(p.get('szi', 0)) > 0 else 'SHORT'
                         break
             
-            # --- 閾値設定 (デイトレ用) ---
-            ENTRY_THRESHOLD = 0.45  # 少し厳しめに
-            CLOSE_THRESHOLD = 0.40  # 逆行したら早めに逃げる
+            # --- ★変更: デイトレ用の閾値設定 ---
+            # 基本エントリーラインを大幅に下げる
+            BASE_THRESHOLD = 0.53  
+            # 撤退ラインも早める (回転率重視)
+            CLOSE_THRESHOLD = 0.55 
 
             action = 'HOLD'
             side = 'NONE'
             reasoning = f"Wait: Up({up_prob:.2f}) Down({down_prob:.2f})"
 
-            # --- 板情報フィルター ---
-            # 買いシグナルだが、板が売り圧(マイナス)なら見送る
-            if imbalance < -0.3 and up_prob > down_prob:
-                reasoning += " (板情報により買い見送り)"
-                confidence = 0 # 自信度を下げる
-            elif imbalance > 0.3 and down_prob > up_prob:
-                reasoning += " (板情報により売り見送り)"
-                confidence = 0
+            # 指標取得
+            indicators = market_analysis.get('indicators', {})
+            rsi = indicators.get('rsi', 50)
+            current_price = market_analysis.get('price', 0)
+            sma_50 = indicators.get('sma_50', current_price)
+
+            # === ★重要: 板情報による補正 (Imbalance Boost) ===
+            # 板が強ければ、AIの確率判定を「甘く」する
+            # imbalance > 0.3 (買い板厚い) -> 上昇確率を +5% 評価
+            # imbalance < -0.3 (売り板厚い) -> 下落確率を +5% 評価
+            
+            adjusted_up_prob = up_prob
+            adjusted_down_prob = down_prob
+            
+            if imbalance > 0.2: # 買い板がやや厚い
+                adjusted_up_prob += 0.03 # 3%下駄を履かせる
+                reasoning += " [板:買い有利]"
+            elif imbalance < -0.2: # 売り板がやや厚い
+                adjusted_down_prob += 0.03 # 3%下駄を履かせる
+                reasoning += " [板:売り有利]"
+
+            # 補正後の自信度を再計算
+            adjusted_confidence = max(adjusted_up_prob, adjusted_down_prob) * 100
 
             if existing_side:
-                # === 決済ロジック (逆行シグナルで撤退) ===
+                # === 決済ロジック (早めに逃げる) ===
+                # 逆行確率が50%を超えたら即撤退 (含み損を拡大させない)
                 if existing_side == 'LONG' and down_prob > CLOSE_THRESHOLD:
                     action = 'CLOSE'
-                    reasoning = f'LONG決済: 下落予測優勢 ({down_prob*100:.1f}%)'
+                    reasoning = f'LONG撤退: 下落予測 ({down_prob*100:.1f}%)'
                 elif existing_side == 'SHORT' and up_prob > CLOSE_THRESHOLD:
                     action = 'CLOSE'
-                    reasoning = f'SHORT決済: 上昇予測優勢 ({up_prob*100:.1f}%)'
+                    reasoning = f'SHORT撤退: 上昇予測 ({up_prob*100:.1f}%)'
                 
-                # === 時間切れ撤退 (Time-based Exit) ===
-                # エントリーから3時間経過しても決済条件にかからない場合は手仕舞い
-                if self.last_entry_time and (datetime.now() - self.last_entry_time).total_seconds() > 3 * 3600:
+                # 2時間経過で撤退 (回転率アップ)
+                if self.last_entry_time and (datetime.now() - self.last_entry_time).total_seconds() > 2 * 3600:
                     action = 'CLOSE'
-                    reasoning = 'TimeExit: ポジション滞留時間超過 (3時間)'
+                    reasoning = 'TimeExit: 2時間経過'
 
             else:
-                # === 新規エントリーロジック ===
-                if up_prob >= ENTRY_THRESHOLD and up_prob > down_prob:
+                # === 新規エントリーロジック (ハイブリッド判定) ===
+                
+                # --- 買い判定 ---
+                # 条件: (補正後確率 > 閾値) AND (RSI < 70) AND (価格 > SMA または 板が強い)
+                # ※「価格 < SMA」でも「板が超強い(0.4以上)」なら逆張りOKとする
+                is_trend_ok_buy = (current_price > sma_50) or (imbalance > 0.4)
+                
+                if (adjusted_up_prob >= BASE_THRESHOLD and 
+                    adjusted_up_prob > adjusted_down_prob and 
+                    rsi < 70 and 
+                    is_trend_ok_buy):
+                    
                     action = 'BUY'
                     side = 'LONG'
-                    reasoning = f'上昇予測: {up_prob*100:.1f}% (Board: {imbalance:.2f})'
-                elif down_prob >= ENTRY_THRESHOLD and down_prob > up_prob:
+                    reasoning = f'BUY: 予測{adjusted_up_prob*100:.1f}%'
+                
+                    # --- 売り判定 ---
+                    is_trend_ok_sell = (current_price < sma_50) or (imbalance < -0.4)
+                
+                elif (adjusted_down_prob >= BASE_THRESHOLD and 
+                      adjusted_down_prob > adjusted_up_prob and 
+                      rsi > 30 and 
+                      is_trend_ok_sell):
+                      
                     action = 'SELL'
                     side = 'SHORT'
-                    reasoning = f'下落予測: {down_prob*100:.1f}% (Board: {imbalance:.2f})'
+                    reasoning = f'SELL: 予測{adjusted_down_prob*100:.1f}%'
             
-            # === ステップ4: 動的リスクパラメータ (ボラティリティ連動) ===
+            # === 動的リスクパラメータ (回転率重視) ===
             volatility = market_analysis.get('volatility', 2.0)
             
-            # ボラティリティに応じたSL/TP設定 (デイトレード用・やや浅め)
-            if volatility > 3.0: # 高ボラ
-                sl_pct, tp_pct = 2.0, 4.0
-            else: # 通常
-                sl_pct, tp_pct = 1.0, 1.5
-            
-            # 期待値 (EV) の概算
-            win_prob = up_prob if action == 'BUY' else down_prob if action == 'SELL' else 0.0
+            # 利益1.5%〜3.0%でサクサク利確する
+            if volatility > 3.0: 
+                sl_pct, tp_pct = 2.0, 3.5 
+            else: 
+                sl_pct, tp_pct = 1.0, 2.0 # 狭く設定してヒット率を上げる
+
+            # 期待値計算
+            win_prob = adjusted_up_prob if action == 'BUY' else adjusted_down_prob if action == 'SELL' else 0.0
             if action in ['BUY', 'SELL']:
                 expected_value_r = (win_prob * tp_pct) - ((1 - win_prob) * sl_pct)
             else:
                 expected_value_r = 0
 
-            # === 最終結果 ===
-            print(f"\n🤖 ML判断詳細:")
+            # ログ表示
+            print(f"\n🤖 ML判断詳細 (Boosted):")
             print(f"   Model: {ml_result['model_used']}")
-            print(f"   Prob: Up {up_prob*100:.1f}% | Down {down_prob*100:.1f}%")
+            print(f"   Raw Prob: Up {up_prob*100:.1f}% | Down {down_prob*100:.1f}%")
+            print(f"   Adj Prob: Up {adjusted_up_prob*100:.1f}% | Down {adjusted_down_prob*100:.1f}%")
             print(f"   Board Imbalance: {imbalance:.2f}")
-            print(f"   Action: {action} (Conf: {confidence})")
+            print(f"   Action: {action} (Conf: {adjusted_confidence:.1f})")
 
             return {
                 'action': action,
                 'side': side,
-                'confidence': confidence,
+                'confidence': adjusted_confidence, # 補正後の自信度を返す
                 'expected_value_r': expected_value_r,
                 'risk_reward_ratio': tp_pct / sl_pct,
                 'stop_loss_percent': sl_pct,
@@ -215,7 +256,9 @@ class TradingBot:
                     'market_regime': signal_data.get('market_regime', 'NORMAL'),
                     'model_used': signal_data.get('model_used', 'ENSEMBLE'),
                     'rsi': signal_data.get('rsi', 0),
-                    'volatility': signal_data.get('volatility', 0)
+                    'volatility': signal_data.get('volatility', 0),
+                    'price_diff': signal_data.get('price_diff', '-'),
+                    'prediction_result': signal_data.get('prediction_result', '-')
                 }
                 self.sheets_logger.log_ai_analysis(analysis_payload)
             
@@ -242,15 +285,19 @@ class TradingBot:
         """
         action = decision.get('action')
 
-        # === 1. EV/RRチェック (BUY/SELLのみ) ===
+        # === 1. EV/RRチェック (手数料考慮版) ===
         ev = float(decision.get('expected_value_r', 0))
         rr_ratio = float(decision.get('risk_reward_ratio', 0))
         
+        # 手数料負けガード (Taker往復 0.07% + バッファ)
+        ESTIMATED_COST_PCT = 0.1
+        net_ev = ev - ESTIMATED_COST_PCT
+
         if action in ['BUY', 'SELL']:
-            if ev <= 0.4: # デイトレ用に少し緩和
-                print(f"🛑 取引拒否: 期待値不足 (EV: {ev:.2f})")
+            if net_ev <= 0.3: 
+                print(f"🛑 取引拒否: 手数料負けリスク (Net EV: {net_ev:.2f}%)")
                 return
-            if rr_ratio < 1.2: # デイトレ用に少し緩和
+            if rr_ratio < 1.2:
                 print(f"🛑 取引拒否: リスクリワード比不足 (RR: {rr_ratio:.2f})")
                 return
         
@@ -261,6 +308,8 @@ class TradingBot:
         available_balance = float(cross_margin.get('totalRawUsd', 0)) or float(margin_summary.get('totalRawUsd', 0))
         
         self.risk_manager.current_capital = account_value
+        
+        # ★重要: 再起動時などのために、ここでのポジション情報を確保しておく
         pos_data = self._get_position_summary(account_state)
         existing_position_value = pos_data['position_value']
         unrealized_pnl = pos_data['unrealized_pnl']
@@ -285,12 +334,12 @@ class TradingBot:
         side = decision.get('side')
         
         # === 7. ポジションサイズ計算 ===
-        if action == 'CLOSE':
-            size = 0.0
-            risk_level = "CLOSE"
-            reasoning = decision.get('reasoning')
-            order_value = 0.0
-        else:
+        size = 0.0
+        risk_level = "CLOSE"
+        reasoning = decision.get('reasoning')
+        order_value = 0.0
+
+        if action != 'CLOSE':
             print(f"\n{'='*70}")
             print(f"🔍 AI自信度ベースのポジションサイズ計算")
             print(f"{'='*70}")
@@ -306,7 +355,7 @@ class TradingBot:
             
             size = position_result['size']
             risk_level = position_result['risk_level']
-            reasoning = position_result['reasoning']
+            reasoning = position_result['reasoning'] # エントリー理由を更新
             order_value = position_result['position_value']
             
             print(f"\n✅ 計算結果:")
@@ -327,13 +376,64 @@ class TradingBot:
             print(f"📉 ポジション決済実行...")
             result = self.trader.close_position(self.symbol)
             trade_success = result and result.get('status') == 'ok'
-            if trade_success:
-                self.last_entry_time = None # エントリー時刻リセット
-        else:
-            # エントリー時刻を記録
-            self.last_entry_time = datetime.now()
             
-            # SL/TP価格計算 (ログ用)
+            if trade_success:
+                # --- 詳細なトレード結果の計算と記録 ---
+                exit_price = current_price
+                
+                # ★修正: メモリにない場合(再起動後など)は、APIから取得したpos_dataを使う
+                if self.trade_context['size'] > 0:
+                    entry_price = self.trade_context['entry_price']
+                    size_closed = self.trade_context['size']
+                    side_closed = self.trade_context['side']
+                    entry_reason = self.trade_context['entry_reason']
+                else:
+                    # 救済措置: メモリが消えていてもAPI情報から計算
+                    entry_price = pos_data['entry_price']
+                    size_closed = pos_data['size']
+                    side_closed = pos_data['side']
+                    entry_reason = "Unknown (Bot Restarted)"
+
+                # 損益計算
+                if side_closed == 'LONG':
+                    raw_pnl = (exit_price - entry_price) * size_closed
+                else: # SHORT
+                    raw_pnl = (entry_price - exit_price) * size_closed
+                
+                # 手数料推定 (往復 0.07%)
+                fee_cost = (entry_price * size_closed * 0.00035) + (exit_price * size_closed * 0.00035)
+                net_pnl = raw_pnl - fee_cost
+                
+                # 経過時間
+                if self.last_entry_time:
+                    duration = datetime.now() - self.last_entry_time
+                else:
+                    duration = timedelta(0)
+                
+                # ログ送信
+                self.sheets_logger.log_trade_result({
+                    'exit_time': datetime.now(),
+                    'symbol': self.symbol,
+                    'side': side_closed,
+                    'size': size_closed,
+                    'entry_price': entry_price,
+                    'exit_price': exit_price,
+                    'pnl': round(net_pnl, 2),
+                    'duration': str(duration).split('.')[0],
+                    'entry_reason': entry_reason,
+                    'exit_reason': decision.get('reasoning')
+                })
+                
+                print(f"📝 トレード結果記録: PnL ${net_pnl:.2f}")
+
+                # コンテキストのリセット
+                self.last_entry_time = None
+                self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE'}
+                self.risk_manager.update_position_tracking(0, "CLOSE")
+
+        else:
+            # --- エントリー注文 ---
+            # SL/TP価格計算 (ログ表示用)
             stop_loss_price = self.risk_manager.calculate_stop_loss(current_price, side, percent=sl_percent)
             take_profit_price = self.risk_manager.calculate_take_profit(current_price, stop_loss_price, rr_ratio)
             
@@ -351,17 +451,22 @@ class TradingBot:
             )
             estimated_fee = order_value * 0.00035
             trade_success = result and result.get('status') == 'ok'
-
-        if trade_success:
-            print("✅ 取引成功!")
-            if action != 'CLOSE':
+            
+            if trade_success:
+                print("✅ 取引成功!")
+                # ★修正: エントリー成功時のみコンテキストを更新する（CLOSEのロジックと分離）
+                self.trade_context = {
+                    'entry_price': current_price,
+                    'entry_reason': reasoning,
+                    'size': size,
+                    'side': side
+                }
+                self.last_entry_time = datetime.now()
                 self.risk_manager.update_position_tracking(order_value, "ADD")
             else:
-                self.risk_manager.update_position_tracking(0, "CLOSE")
-        else:
-            print("❌ 取引失敗")
-        
-        # === 9. Google Sheetsログ記録 ===
+                print("❌ 取引失敗")
+
+        # === 9. Google Sheetsログ記録 (Executions/AI/Equity) ===
         self.log_to_sheets(
             trade_data={
                 'timestamp': datetime.now(),
@@ -372,7 +477,7 @@ class TradingBot:
                 'price': current_price,
                 'order_value': order_value,
                 'fee': estimated_fee if trade_success else 0,
-                'realized_pnl': 0,
+                'realized_pnl': 0, # ここは未確定分
                 'unrealized_pnl': unrealized_pnl, 
                 'confidence': confidence,
                 'signal_strength': analysis.get('signal_strength', 0),
@@ -391,7 +496,9 @@ class TradingBot:
                 'volatility': analysis.get('volatility', 0),
                 'rsi': analysis.get('indicators', {}).get('rsi', 0),
                 'market_regime': decision.get('market_regime', 'NORMAL'),
-                'model_used': decision.get('reasoning', '').split('|')[-1].strip()
+                'model_used': decision.get('reasoning', '').split('|')[-1].strip(),
+                'price_diff': decision.get('price_diff', '-'),
+                'prediction_result': decision.get('prediction_result', '-')
             },
             snapshot_data={
                 'timestamp': datetime.now(),
@@ -452,7 +559,7 @@ class TradingBot:
 
     def run_trading_loop(self, interval=60):
         """
-        自動取引ループ
+        自動取引ループ (改良版: トレード品質格付け判定付き)
         """
         self.running = True
         self.online_learner.start_background_learning()
@@ -528,46 +635,74 @@ class TradingBot:
                             confidence = decision.get('confidence', 0)
                             up_prob = decision['ml_probabilities']['up']
                             down_prob = decision['ml_probabilities']['down']
+                            
+                            # === 変数初期化 ===
+                            prediction_result = "⏳ 判定待ち" 
                             price_diff_str = "-"
-                            pred_result = "-"
 
-                            if last_ai_state['price'] is not None:
-                                # 価格変動の計算
-                                diff = current_price - last_ai_state['price']
-                                sign = "+" if diff > 0 else ""
-                                price_diff_str = f"{sign}{diff:.2f}"
-                                
-                                # 前回のAI予測はどうだったか？
-                                prev_up = last_ai_state['up_prob']
-                                prev_down = last_ai_state['down_prob']
-                                prev_action = last_ai_state['action']
-                                
-                                # 判定ロジック
-                                is_price_up = (diff > 0.5)   # 0.5ドル以上の動きを反応とする
-                                is_price_down = (diff < -0.5)
-                                
-                                if prev_action in ['BUY', 'SELL'] or (prev_up > 0.45 or prev_down > 0.45):
-                                    # AIが方向性を持っていた場合
-                                    if (prev_up > prev_down and is_price_up) or (prev_down > prev_up and is_price_down):
-                                        pred_result = "✅ 正解"
-                                    elif (prev_up > prev_down and is_price_down) or (prev_down > prev_up and is_price_up):
-                                        pred_result = "❌ 不正解"
-                                    else:
-                                        pred_result = "➖ 微動"
-                                else:
-                                    # AIが様子見(HOLD)だった場合
-                                    if abs(diff) > 5.0: # 大きく動いたのに見送った場合
-                                        pred_result = "⚠️ 機会損失" 
-                                    else:
-                                        pred_result = "⚪️ レンジ的中" # 動かなかったので見送り正解
-
-                            # 状態の更新
-                            last_ai_state = {
+                            # 1. 現在の予測を履歴に追加
+                            # ★改善: 「その時の自信度(confidence)」も一緒に保存する
+                            self.prediction_history.append({
+                                'timestamp': current_time,
                                 'price': current_price,
                                 'up_prob': up_prob,
                                 'down_prob': down_prob,
-                                'action': action
-                            }
+                                'confidence': confidence # 追加
+                            })
+
+                            # 2. 15分以上前のデータを探して検証
+                            while len(self.prediction_history) > 0:
+                                old_data = self.prediction_history[0]
+                                time_diff = current_time - old_data['timestamp']
+                                
+                                if time_diff < 900: # 15分未満なら終了
+                                    break
+                                
+                                target_data = self.prediction_history.popleft()
+                                
+                                # --- 答え合わせロジック (格付け機能付き) ---
+                                past_price = target_data['price']
+                                past_conf = target_data.get('confidence', 0)
+                                price_change = current_price - past_price
+                                sign = "+" if price_change > 0 else ""
+                                price_diff_str = f"{sign}{price_change:.2f}" 
+                                
+                                past_up = target_data['up_prob']
+                                past_down = target_data['down_prob']
+                                
+                                # トレード対象になるレベルだったか？ (Conf >= 35)
+                                is_trade_level = (past_conf >= 35)
+
+                                result_label = "⚪️ Draw"
+                                
+                                # AI予測: 上昇
+                                if past_up > past_down:
+                                    if price_change > 0:
+                                        # 的中
+                                        if is_trade_level: result_label = f"🏆 トレード勝利 (Conf:{past_conf:.0f})"
+                                        else: result_label = "✅ 方向正解 (見送り)"
+                                    else:
+                                        # ハズレ
+                                        if is_trade_level: result_label = f"💀 トレード敗北 (Conf:{past_conf:.0f})"
+                                        else: result_label = "❌ 方向不正解"
+                                
+                                # AI予測: 下落
+                                elif past_down > past_up:
+                                    if price_change < 0:
+                                        # 的中
+                                        if is_trade_level: result_label = f"🏆 トレード勝利 (Conf:{past_conf:.0f})"
+                                        else: result_label = "✅ 方向正解 (見送り)"
+                                    else:
+                                        # ハズレ
+                                        if is_trade_level: result_label = f"💀 トレード敗北 (Conf:{past_conf:.0f})"
+                                        else: result_label = "❌ 方向不正解"
+                                
+                                prediction_result = result_label
+                                break
+
+                            # decisionに結果を格納
+                            decision['price_diff'] = price_diff_str
+                            decision['prediction_result'] = prediction_result
                             
                             # 4. AI思考ログの作成
                             signal_log = {
@@ -582,20 +717,18 @@ class TradingBot:
                                 'market_regime': decision.get('market_regime'),
                                 'model_used': decision.get('reasoning', '').split('|')[-1].strip(),
                                 'price_diff': price_diff_str,
-                                'prediction_result': pred_result
+                                'prediction_result': prediction_result
                             }
-
+                            
                             # 5. 取引実行 または ログ記録のみ
                             if action == "CLOSE":
                                 self.execute_trade(decision, current_price, account_state, analysis)
                             
                             elif action in ['BUY', 'SELL']:
-                                # 閾値を 35% に緩和 (デイトレ用)
-                                if confidence >= 35:
+                                if confidence >= 50:
                                     self.execute_trade(decision, current_price, account_state, analysis)
                                 else:
-                                    print(f"⏸️ 信頼度不足で見送り ({confidence}%)")
-                                    self.log_to_sheets(signal_data=signal_log)
+                                    print(f"⏸️ 信頼度不足で見送り ({confidence:.1f}%)")
                             else:
                                 self.log_to_sheets(signal_data=signal_log)
 

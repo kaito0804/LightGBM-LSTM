@@ -39,7 +39,7 @@ class GoogleSheetsLogger:
             'equity': deque(maxlen=50)
         }
         self.last_flush = time.time()
-        self.flush_interval = 300  # 5分
+        self.flush_interval = 60  # 5分
         
         self._authenticate()
         self._setup_spreadsheet()
@@ -79,7 +79,8 @@ class GoogleSheetsLogger:
         sheets_config = [
             ("実行履歴", ["日時", "アクション", "方向", "数量(ETH)", "価格($)", "手数料($)", "実現損益($)", "残高($)", "理由"]),
             ("AI分析", ["日時", "現在価格", "AI判断", "信頼度(%)", "上昇確率(%)", "下降確率(%)", "市場レジーム", "使用モデル", "RSI", "Volatility", "前回比($)", "予測判定"]),
-            ("資産推移", ["日時", "総資産($)", "利用可能($)", "ポジション価値($)", "未実現損益($)", "累積実現損益($)"])
+            ("資産推移", ["日時", "総資産($)", "利用可能($)", "ポジション価値($)", "未実現損益($)", "累積実現損益($)"]),
+            ("Trade_History", ["Exit Time", "Symbol", "Side", "Size", "Entry Price", "Exit Price", "PnL ($)", "Result", "Duration", "Entry Reason", "Exit Reason"])
         ]
 
         for title, headers in sheets_config:
@@ -155,6 +156,45 @@ class GoogleSheetsLogger:
         self.buffer['equity'].append(row)
         self._try_flush()
 
+
+    def log_trade_result(self, data: Dict[str, Any]):
+        """詳細なトレード結果を記録 (Trade_Historyシート用)"""
+        # シートが開かれていなければ何もしない
+        if not self.spreadsheet: return
+        
+        try:
+            # 勝ち負けの判定アイコン設定
+            pnl = float(data.get('pnl', 0))
+            if pnl > 0:
+                result_icon = "🏆 WIN"
+            elif pnl < 0:
+                result_icon = "💀 LOSE"
+            else:
+                result_icon = "⚪ DRAW"
+            
+            row = [
+                str(data.get('exit_time')),      # Exit Time
+                data.get('symbol'),              # Symbol
+                data.get('side'),                # Side
+                data.get('size'),                # Size
+                data.get('entry_price'),         # Entry Price
+                data.get('exit_price'),          # Exit Price
+                pnl,                             # PnL ($)
+                result_icon,                     # Result
+                str(data.get('duration')),       # Duration
+                data.get('entry_reason'),        # Entry Reason
+                data.get('exit_reason')          # Exit Reason
+            ]
+            
+            # Trade_Historyは頻度が低いのでバッファを使わず直接書き込む
+            # insert_row(..., index=2) でヘッダーの直下に挿入（最新が上に来る）
+            sheet = self.spreadsheet.worksheet("Trade_History")
+            sheet.insert_row(row, index=2, value_input_option='USER_ENTERED')
+            print(f"📝 トレード履歴記録完了: {result_icon} ${pnl}")
+            
+        except Exception as e:
+            print(f"⚠️ トレード履歴ログエラー: {e}")
+            
     # ========== バッファ処理 ==========
 
     def _try_flush(self, force: bool = False):
