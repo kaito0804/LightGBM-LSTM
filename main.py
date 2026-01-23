@@ -23,8 +23,8 @@ SECURE_PROFIT_TP_PCT = float(os.getenv('SECURE_TAKE_PROFIT', '4.0'))
 MIN_SIGNAL_STRENGTH = int(os.getenv('MIN_SIGNAL_STRENGTH', '45'))
 
 # 時間軸設定
-MAIN_TIMEFRAME = '15m'  # デイトレードの主軸
-TREND_TIMEFRAME = '1h'  # 環境認識用
+MAIN_TIMEFRAME = os.getenv('MAIN_TIMEFRAME', '15m')  # デイトレードの主軸
+TREND_TIMEFRAME = os.getenv('TREND_TIMEFRAME', '1h')  # 環境認識用
 
 class TradingBot:
     """
@@ -672,16 +672,37 @@ class TradingBot:
                         self.last_oi = current_oi
                     
                     if analysis:
-                        volatility = analysis.get('volatility', 0)
-                        print(f"   Vol: {volatility:.2f}% | Imb: {fast_imbalance:.2f} | OI: {current_oi:.2f} | OI Δ: {oi_delta_pct:+.4f}%")
-
-                        # 設定した閾値（.envのLOW_VOLATILITY_THRESHOLD、デフォルト1.5）未満ならスキップ
-                        # ここでは安全のためハードコード気味に 1.0% 未満は絶対停止とする例
-                        MIN_VOLATILITY_LIMIT = 1.0 
+                        # --- ATRベースの高感度ボラティリティ判定 ---
                         
-                        if volatility < MIN_VOLATILITY_LIMIT:
-                            print(f"💤 低ボラティリティのため待機 (Vol: {volatility:.2f}% < {MIN_VOLATILITY_LIMIT}%)")
-                            last_ai_check_time = current_time # 時間は更新して、次のインターバルまで寝る
+                        # 1. メイン時間軸(15m)のデータを直接取得
+                        tf_data = analysis['timeframes'].get(MAIN_TIMEFRAME, {})
+                        atr_val = tf_data.get('atr', 0)
+                        
+                        # 2. ATRをパーセンテージに変換 (ATR / 価格 * 100)
+                        # ※ ATRは「平均的な足の実体+ヒゲの長さ」を示すため、これが極端に小さいと利益が出ない
+                        if current_price > 0:
+                            atr_pct = (atr_val / current_price) * 100
+                        else:
+                            atr_pct = 0.0
+
+                        # 参考用に従来のVolも取得（ログ表示用）
+                        std_vol = analysis.get('volatility', 0)
+
+                        print(f"   ATR(15m): {atr_pct:.3f}% (${atr_val:.2f}) | StdVol(1h): {std_vol:.2f}%")
+                        print(f"   Imb: {fast_imbalance:.2f} | OI: {current_oi:.0f} | OI Δ: {oi_delta_pct:+.4f}%")
+
+                        # 3. 閾値判定
+                        # 15分足で価格の0.3%も動かない(例: $3000のETHで$9未満)なら、
+                        # スプレッドと手数料で負けるため待機する。
+                        MIN_ATR_LIMIT = 0.3 
+                        
+                        if atr_pct < MIN_ATR_LIMIT:
+                            status_msg = f"💤 低ボラティリティ待機 (ATR: {atr_pct:.3f}% < {MIN_ATR_LIMIT}%)"
+                            print(status_msg)
+                            
+                            # ただしログが埋まるのを防ぐため、1時間に1回程度にするなどの工夫推奨
+                            # self.log_to_sheets(signal_data={'action': 'WAIT', 'reasoning': status_msg, ...})
+                            last_ai_check_time = current_time 
                             time.sleep(fast_interval)
                             continue
                         

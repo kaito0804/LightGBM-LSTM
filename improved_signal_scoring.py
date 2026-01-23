@@ -157,8 +157,11 @@ class ImprovedSignalScoring:
         総合スコア計算
         DataCollector/MarketDataで計算済みの値を集約する
         """
-        # 基準となる1時間足の環境認識
-        base_tf = timeframe_data.get('1h', {})
+        # (1hだと反応が遅く、デイトレの環境認識として機能しないため)
+        base_tf = timeframe_data.get('15m', {})
+        if not base_tf:
+            base_tf = timeframe_data.get('1h', {})
+            
         volatility = base_tf.get('volatility', 2.0)
         
         # トレンド強度 (SMA20と50の乖離)

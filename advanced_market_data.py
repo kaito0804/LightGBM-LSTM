@@ -34,11 +34,15 @@ class AdvancedMarketData:
         self.api_base = "https://api.hyperliquid.xyz"
         
         self.info_url = f"{self.api_base}/info"
+
+        # デイトレードの主軸を環境変数から取得（なければ15m）
+        self.main_timeframe = os.getenv("MAIN_TIMEFRAME", "15m")
         
         print(f"📊 AdvancedMarketData初期化")
         print(f"   ネットワーク: {self.network.upper()}")
         print(f"   シンボル: {self.symbol}")
         print(f"   API: {self.api_base}")
+        print(f"   主軸タイムフレーム: {self.main_timeframe}") 
         
         if self.network == "mainnet":
             print(f"   ⚠️ Mainnetモード: フォールバックデータ無効")
@@ -388,8 +392,8 @@ class AdvancedMarketData:
             }
             analysis['timeframes'][tf] = tf_data
             
-            # ✅ 1h足のデータをメイン指標としてコピー (重複計算回避)
-            if tf == '1h':
+            # --- 設定したメイン時間軸（15m）のデータを優先採用する ---
+            if tf == self.main_timeframe:
                 analysis['indicators'] = {
                     'rsi': rsi,
                     'macd': macd,
@@ -501,7 +505,7 @@ class AdvancedMarketData:
                     "type": "candleSnapshot", 
                     "req": {
                         "coin": "BTC", 
-                        "interval": "1h", 
+                        "interval": self.main_timeframe, 
                         "startTime": int((datetime.now().timestamp() - 7200) * 1000), # 2時間前
                         "endTime": int(datetime.now().timestamp() * 1000)
                     }
