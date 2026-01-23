@@ -10,14 +10,19 @@ class DataCollector:
     修正版: 3値分類（上昇/下降/中立）データ収集
     - Pandasベクトル演算により高速に学習データを生成
     - ATRベースの動的ラベル付けを実装
-    - ✅ 修正: 板情報・BTC相関などのカラムを0で初期化して警告を回避
+    - ✅ BTC相関・トレンド強度を実データから計算して付与
+    - ℹ️ 板情報(orderbook)は過去データ取得不可のため0埋め継続
     """
     
     def __init__(self, symbol='ETH', data_dir='training_data'):
         self.symbol = symbol
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
+        
+        # 対象通貨のマーケットデータ
         self.market = AdvancedMarketData(symbol)
+        # BTC相関算出用のマーケットデータ
+        self.btc_market = AdvancedMarketData('BTC')
         
         # デイトレ用にホライゾンを短縮 (1本先の予測)
         self.prediction_horizon = 1 
@@ -27,28 +32,85 @@ class DataCollector:
     def collect_historical_data(self, timeframe='1h', limit=2000):
         print(f"\n📥 {timeframe}足データ収集中... (目標: {limit}本)")
         
-        # APIからデータ取得
+        # 1. 対象通貨のデータ取得
         df = self.market.get_ohlcv(timeframe=timeframe, limit=limit)
-        
         if df is None or len(df) < 100:
             print("⚠️ データ不足または取得失敗")
             return None
+
+        # 2. BTCデータの取得（相関特徴量用）
+        print(f"   ➕ BTCデータ同期中...")
+        df_btc = self.btc_market.get_ohlcv(timeframe=timeframe, limit=limit)
         
-        # テクニカル指標計算 (Seriesとして一括計算)
+        # 3. データの結合とBTC特徴量の計算
+        if df_btc is not None and len(df_btc) > 100:
+            df = self.add_btc_features(df, df_btc)
+        else:
+            print("⚠️ BTCデータ取得失敗のため、BTC特徴量は0で埋めます")
+            df['btc_correlation'] = 0.0
+            df['btc_trend_strength'] = 0.0
+
+        # 4. テクニカル指標計算 (Seriesとして一括計算)
         df = self.add_technical_indicators(df)
         
-        # ✅ 追加: リアルタイム系特徴量のカラムを作成（0埋め）
-        # これにより train_models.py での「特徴量不足」警告が消えます
-        missing_features = ['orderbook_imbalance', 'btc_correlation', 'btc_trend_strength']
+        # 5. その他のリアルタイム系特徴量（板情報など）
+        # ※過去の板情報はAPIで取得できないため、引き続き0.0で初期化します
+        #   (ライブトレード時には advanced_market_data.py がリアルタイム値を取得します)
+        missing_features = ['orderbook_imbalance']
         for col in missing_features:
             df[col] = 0.0
         
         # ラベル作成 (ATR動的閾値)
         df = self.create_labels(df, horizon=self.prediction_horizon)
         
-        # 欠損値除去 (SMA計算などで発生したNaNを消す)
+        # 欠損値除去 (SMA計算や相関計算で発生したNaNを消す)
         df = df.dropna()
         
+        return df
+
+    def add_btc_features(self, df: pd.DataFrame, df_btc: pd.DataFrame) -> pd.DataFrame:
+        """
+        BTCデータとマージして相関とトレンド強度を計算
+        """
+        # タイムスタンプでマージ (inner joinで両方存在する期間のみ残す)
+        # suffixesを使ってカラム名を区別: close -> close_target, close_btc
+        merged = pd.merge(
+            df, 
+            df_btc[['timestamp', 'close', 'volume']], 
+            on='timestamp', 
+            how='inner', 
+            suffixes=('', '_btc')
+        )
+        
+        # マージによって行が減る可能性があるため、dfを更新
+        df = merged.copy()
+
+        # --- 1. BTC相関 (Rolling Correlation) ---
+        # 過去24期間（例えば1時間足なら24時間）の相関
+        window_size = 24
+        df['btc_correlation'] = df['close'].rolling(window=window_size).corr(df['close_btc'])
+        
+        # NaN埋め (相関なし=0)
+        df['btc_correlation'] = df['btc_correlation'].fillna(0)
+
+        # --- 2. BTCトレンド強度 ---
+        # 短期(10)と長期(30)の移動平均の乖離率をトレンド強度とする
+        btc_sma10 = df['close_btc'].rolling(10).mean()
+        btc_sma30 = df['close_btc'].rolling(30).mean()
+        
+        # トレンド強度: (短期 - 長期) / 長期 * 100
+        # プラスなら上昇トレンド、マイナスなら下降トレンドの強さ
+        df['btc_trend_strength'] = (btc_sma10 - btc_sma30) / btc_sma30 * 100
+        df['btc_trend_strength'] = df['btc_trend_strength'].fillna(0)
+
+        # 不要なBTCカラムを削除 (close_btc, volume_btc)
+        # メモリ節約のため
+        if 'close_btc' in df.columns:
+            del df['close_btc']
+        if 'volume_btc' in df.columns:
+            del df['volume_btc']
+
+        print(f"   ✅ BTC特徴量計算完了 (相関 & トレンド強度)")
         return df
     
     def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
