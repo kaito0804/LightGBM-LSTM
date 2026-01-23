@@ -46,6 +46,9 @@ class MLPredictor:
         
         # 特徴量定義 (Imbalanceを追加)
         self.feature_cols = [
+            'orderbook_imbalance',  
+            'btc_correlation',      
+            'btc_trend_strength',
             'rsi', 'macd_hist', 'bb_position', 'bb_width',
             'atr', 'volume_ratio', 'price_change_1h',
             'price_change_4h', 'sma_20_50_ratio', 'volatility',
@@ -129,7 +132,9 @@ class MLPredictor:
         df['hour_cos'] = np.cos(2 * np.pi * hours / 24)
         df['day_of_week'] = dayofweek / 6.0
 
-        latest_features = df.iloc[[-1]][[c for c in self.feature_cols if c != 'orderbook_imbalance']].fillna(0)
+        available_cols  = [c for c in self.feature_cols if c in df.columns]
+        latest_features = df.iloc[[-1]][available_cols].fillna(0)
+        
         return latest_features
 
     def prepare_lstm_data(self, prices: np.ndarray) -> np.ndarray:
@@ -161,8 +166,23 @@ class MLPredictor:
 
         # 1. 特徴量作成
         features = self.create_features_from_history(df)
+
         if features is None:
             return {'action': 'HOLD', 'confidence': 0, 'model_used': 'NONE'}
+        
+        # 2. リアルタイムデータの注入
+        # extra_features は advanced_market_data.py の get_market_structure_features() から来る値を想定
+        if extra_features:
+            features['orderbook_imbalance'] = extra_features.get('orderbook_imbalance', 0.0)
+            features['btc_correlation'] = extra_features.get('btc_trend', 0.0) 
+            features['btc_trend_strength'] = abs(extra_features.get('btc_trend', 0.0))
+        else:
+            # データがない場合は0埋めするが、ログ警告を出すべき
+            print("⚠️ 警告: 板情報・BTCデータが欠落しています。精度が低下します。")
+            features['orderbook_imbalance'] = 0.0
+            features['btc_correlation'] = 0.0
+            features['btc_trend_strength'] = 0.0
+        
 
         # カラム順序の保証と欠損埋め
         for col in self.feature_cols:
@@ -316,7 +336,7 @@ class MLPredictor:
             LSTM(32), Dropout(0.2), Dense(3, activation='softmax')
         ])
         model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-        model.fit(X, y, epochs=epochs, batch_size=32, validation_split=0.2, verbose=0)
+        model.fit(X, y, epochs=epochs, batch_size=32, validation_split=0.2, verbose=1)
         
         with self.model_lock:
             self.lstm_model = model

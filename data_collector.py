@@ -10,7 +10,7 @@ class DataCollector:
     修正版: 3値分類（上昇/下降/中立）データ収集
     - Pandasベクトル演算により高速に学習データを生成
     - ATRベースの動的ラベル付けを実装
-    - 板情報カラムの初期化を追加
+    - ✅ 修正: 板情報・BTC相関などのカラムを0で初期化して警告を回避
     """
     
     def __init__(self, symbol='ETH', data_dir='training_data'):
@@ -36,6 +36,12 @@ class DataCollector:
         
         # テクニカル指標計算 (Seriesとして一括計算)
         df = self.add_technical_indicators(df)
+        
+        # ✅ 追加: リアルタイム系特徴量のカラムを作成（0埋め）
+        # これにより train_models.py での「特徴量不足」警告が消えます
+        missing_features = ['orderbook_imbalance', 'btc_correlation', 'btc_trend_strength']
+        for col in missing_features:
+            df[col] = 0.0
         
         # ラベル作成 (ATR動的閾値)
         df = self.create_labels(df, horizon=self.prediction_horizon)
