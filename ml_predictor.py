@@ -157,9 +157,12 @@ class MLPredictor:
             
         return normalized.reshape(1, self.lstm_lookback, 1)
 
+    # ---------------------------------------------------------
+# MLPredictorクラス内の predict 関数を丸ごとこれに置き換えてください
+# ---------------------------------------------------------
     def predict(self, df: pd.DataFrame, extra_features: dict = None) -> dict:
         """
-        予測実行 (外部特徴量対応)
+        予測実行 (執行フィルター付き)
         """
         if df is None or len(df) < 100:
             return {'action': 'HOLD', 'confidence': 0, 'reasoning': 'データ不足', 'model_used': 'NONE'}
@@ -171,19 +174,16 @@ class MLPredictor:
             return {'action': 'HOLD', 'confidence': 0, 'model_used': 'NONE'}
         
         # 2. リアルタイムデータの注入
-        # extra_features は advanced_market_data.py の get_market_structure_features() から来る値を想定
         if extra_features:
             features['orderbook_imbalance'] = extra_features.get('orderbook_imbalance', 0.0)
             features['btc_correlation'] = extra_features.get('btc_trend', 0.0) 
             features['btc_trend_strength'] = abs(extra_features.get('btc_trend', 0.0))
         else:
-            # データがない場合は0埋めするが、ログ警告を出すべき
             print("⚠️ 警告: 板情報・BTCデータが欠落しています。精度が低下します。")
             features['orderbook_imbalance'] = 0.0
             features['btc_correlation'] = 0.0
             features['btc_trend_strength'] = 0.0
         
-
         # カラム順序の保証と欠損埋め
         for col in self.feature_cols:
             if col not in features.columns:
@@ -194,7 +194,7 @@ class MLPredictor:
             lgb_model = self.lgb_model
             lstm_model = self.lstm_model
 
-        # 2. LightGBM 予測
+        # 3. LightGBM 予測
         lgb_up = 0.0
         lgb_down = 0.0
         lgb_used = False
@@ -208,7 +208,7 @@ class MLPredictor:
             except Exception as e:
                 print(f"⚠️ LGBM予測エラー: {e}")
 
-        # 3. LSTM 予測
+        # 4. LSTM 予測
         lstm_up = 0.0
         lstm_down = 0.0
         lstm_used = False
@@ -224,9 +224,9 @@ class MLPredictor:
             except Exception as e:
                 print(f"⚠️ LSTM予測エラー: {e}")
 
-        # 4. アンサンブル
+        # 5. アンサンブル (確率の統合)
         if lgb_used and lstm_used:
-            final_up = (lgb_up * 0.6 + lstm_up * 0.4) # LGBMを少し重視
+            final_up = (lgb_up * 0.6 + lstm_up * 0.4)
             final_down = (lgb_down * 0.6 + lstm_down * 0.4)
             model_name = "Ensemble"
         elif lgb_used:
@@ -240,13 +240,49 @@ class MLPredictor:
         else:
             return {'action': 'HOLD', 'confidence': 0, 'reasoning': 'モデル予測失敗', 'model_used': 'NONE'}
 
+        # ---------------------------------------------------------
+        # AIがGOサインを出しても、板情報やBTC状況が悪ければ拒否する
+        # ---------------------------------------------------------
+        filter_reason = ""
+        is_filtered = False
+
+        # 板情報 (Imbalance) のチェック
+        # 値が正なら買い圧、負なら売り圧
+        imbalance = features['orderbook_imbalance'].iloc[-1]
+        
+        if final_up > final_down: # AI判断: BUY
+            # 売り板が極端に厚い場合 (-0.3以下) はキャンセル
+            if imbalance < -0.3:
+                is_filtered = True
+                filter_reason = f"売り板厚過多(Imb:{imbalance:.2f})"
+                final_up = 0.0 # 強制リセット
+        
+        elif final_down > final_up: # AI判断: SELL
+            # 買い板が極端に厚い場合 (0.3以上) はキャンセル
+            if imbalance > 0.3:
+                is_filtered = True
+                filter_reason = f"買い板厚過多(Imb:{imbalance:.2f})"
+                final_down = 0.0 # 強制リセット
+
+        # BTC相関フィルター
+        # BTCが急落中 (-0.5%以下) にETHの買いを入れるのは危険
+        btc_trend = features['btc_correlation'].iloc[-1]
+        if final_up > final_down and btc_trend < -0.5:
+             is_filtered = True
+             filter_reason = f"BTC急落中({btc_trend:.2f}%)"
+             final_up = 0.0
+
+        if is_filtered:
+            print(f"🛡️ 執行フィルター発動: {filter_reason} -> エントリーをキャンセル")
+
         # 自信度計算
         max_prob = max(final_up, final_down)
-        # 0.35以上で反応開始
-        if max_prob < 0.35:
+        
+        # 閾値 (0.4以上で反応)
+        if max_prob < 0.4:
             confidence = 0
         else:
-            confidence = (max_prob - 0.35) / (0.85 - 0.35) * 100
+            confidence = (max_prob - 0.4) / (0.9 - 0.4) * 100
             confidence = min(100, max(0, confidence))
 
         return {
@@ -255,7 +291,7 @@ class MLPredictor:
             'down_prob': final_down,
             'confidence': int(confidence),
             'model_used': model_name,
-            'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f}"
+            'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f} {filter_reason}"
         }
 
     def evaluate_model(self, model, X_val, y_val, model_type='lgb'):

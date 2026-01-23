@@ -104,7 +104,7 @@ class TradingBot:
             oi_delta = structure_data.get('oi_delta_pct', 0.0)
             
             # === ステップ2: ML予測実行 ===
-            ml_result = self.ml_predictor.predict(df_main)
+            ml_result = self.ml_predictor.predict(df_main, extra_features=structure_data)
             
             # 予測不能時の早期リターン (ここでも ml_probabilities を含めるのが安全)
             if ml_result.get('model_used') == 'NONE':
@@ -159,6 +159,20 @@ class TradingBot:
                     adjusted_down_prob += 0.03
                     reasoning += f" [OI増:追随]"
 
+            # スコアを取得
+            signal_score = market_analysis.get('signal_strength', 50)
+
+            # スコア50を基準に ±調整 (例: 70点なら+2%、30点なら-2%)
+            # 係数 0.001 は影響度を調整 (1点あたり0.1%の影響)
+            score_adjust = (signal_score - 50) * 0.001 
+            
+            # 上昇確率に加算、下落確率からは減算 (整合性を保つため)
+            adjusted_up_prob += score_adjust
+            adjusted_down_prob -= score_adjust
+            
+            if abs(score_adjust) > 0.01:
+                 reasoning += f" [Score補正:{score_adjust*100:+.1f}%]"
+
             # 補正後の自信度
             adjusted_confidence = max(adjusted_up_prob, adjusted_down_prob) * 100
 
@@ -188,12 +202,12 @@ class TradingBot:
                 # これにより if文の中で変数が定義されないエラーを防ぐ
                 is_trend_ok_buy = (current_price > sma_50)
                 is_trend_ok_sell = (current_price < sma_50)
-                
-                # 判定ロジック
+                can_buy = is_trend_ok_buy or (rsi < 30)
+
                 if (adjusted_up_prob >= buy_threshold and 
                     adjusted_up_prob > adjusted_down_prob and 
                     rsi < 70 and 
-                    is_trend_ok_buy):
+                    can_buy):
                     
                     action = 'BUY'
                     side = 'LONG'
@@ -484,7 +498,8 @@ class TradingBot:
                     'entry_price': current_price,
                     'entry_reason': reasoning,
                     'size': size,
-                    'side': side
+                    'side': side,
+                    'sl_percent': sl_percent  
                 }
                 self.last_entry_time = datetime.now()
                 self.risk_manager.update_position_tracking(order_value, "ADD")
@@ -596,6 +611,7 @@ class TradingBot:
         try:
             last_ai_check_time = 0
             fast_interval = 1 
+            ai_loop_count = 0
 
             last_ai_state = {
                 'price': None,
@@ -634,8 +650,11 @@ class TradingBot:
                 if (current_time - last_ai_check_time >= interval) or (last_ai_check_time == 0):
                     
                     # モデルのホットリロード
-                    if self.ml_predictor:
-                         try: self.ml_predictor.load_models()
+                    ai_loop_count += 1
+                    if self.ml_predictor and (ai_loop_count % 10 == 0):
+                         try: 
+                             print("🔄 モデルを再読み込み中...") 
+                             self.ml_predictor.load_models()
                          except: pass
 
                     print(f"\n{'='*70}")
@@ -796,7 +815,7 @@ class TradingBot:
                                 self.execute_trade(decision, current_price, account_state, analysis)
                             
                             elif action in ['BUY', 'SELL']:
-                                if confidence >= 50:
+                                if confidence >= MIN_SIGNAL_STRENGTH:
                                     self.execute_trade(decision, current_price, account_state, analysis)
                                 else:
                                     print(f"⏸️ 信頼度不足で見送り ({confidence:.1f}%)")
@@ -813,31 +832,112 @@ class TradingBot:
                 
         except KeyboardInterrupt:
             print("\n⏸️ 停止")
+            if self.sheets_logger:
+                self.sheets_logger.force_flush()
+
             self.online_learner.stop_background_learning()
             self.running = False
 
+
+
     def _check_emergency_exit(self, pos_data, current_price):
         """
-        緊急決済ロジック
+        緊急決済ロジック (改良版: 動的SL対応)
+        高速監視ループ(10秒ごと)で呼び出され、AIが設定した個別SLまたは緊急SLに達していたら即時決済する
         """
         entry_px = pos_data['entry_price']
         side = pos_data['side']
+        size = pos_data['size']
         
+        # --- 1. PnL% (含み損益率) の計算 ---
         if side == 'LONG':
             pnl_pct = ((current_price - entry_px) / entry_px * 100)
         else:
             pnl_pct = ((entry_px - current_price) / entry_px * 100)
         
-        if pnl_pct <= EMERGENCY_SL_PCT:
-            print(f"🚨 緊急損切り: {pnl_pct:.2f}%")
+        # --- 2. 損切り閾値の決定  ---
+        # execute_tradeで保存された今回のトレード専用のSL設定を取得
+        mem_sl = self.trade_context.get('sl_percent', None)
+
+        if mem_sl is not None:
+            # メモリ上のSLは正の値(例: 1.0)なので、負の値(-1.0)に変換して比較
+            current_sl_threshold = -abs(float(mem_sl))
+            sl_source = "Dynamic(AI)"
+        else:
+            # メモリになければ全体設定(例: -2.0)を使用
+            current_sl_threshold = EMERGENCY_SL_PCT
+            sl_source = "Emergency(Global)"
+
+        # --- 3. 判定と実行 ---
+        
+        # [A] 損切り (Stop Loss)
+        if pnl_pct <= current_sl_threshold:
+            print(f"🚨 {sl_source} 損切り実行: {pnl_pct:.2f}% (閾値: {current_sl_threshold}%)")
+            
+            # 決済実行
             self.trader.close_position(self.symbol)
+            
+            # 損益概算（ログ用）
+            pnl_amount = (current_price - entry_px) * size if side == 'LONG' else (entry_px - current_price) * size
+
+            # ログ記録
+            self.log_to_sheets(trade_data={
+                'timestamp': datetime.now(),
+                'symbol': self.symbol,
+                'action': 'CLOSE',
+                'side': side,
+                'size': size,
+                'price': current_price,
+                'order_value': size * current_price,
+                'fee': 0, 
+                'realized_pnl': pnl_amount,
+                'unrealized_pnl': 0,
+                'confidence': 0,
+                'signal_strength': 0,
+                'leverage': 0,
+                'balance': 0,
+                'reasoning': f'{sl_source} Stop Loss ({pnl_pct:.2f}%)',
+                'status': 'EXECUTED'
+            })
+
+            # コンテキストとリスク管理状態のリセット
             self.risk_manager.update_position_tracking(0, "CLOSE")
             self.last_entry_time = None
+            # sl_percent も含めて初期化
+            self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE', 'sl_percent': None}
+
+        # [B] 利確 (Take Profit) - 全体設定のSECURE_PROFIT_TP_PCTを使用
         elif pnl_pct >= SECURE_PROFIT_TP_PCT:
-            print(f"🎉 緊急利確: {pnl_pct:.2f}%")
+            print(f"🎉 緊急利確実行: {pnl_pct:.2f}% (閾値: {SECURE_PROFIT_TP_PCT}%)")
+            
             self.trader.close_position(self.symbol)
+            
+            pnl_amount = (current_price - entry_px) * size if side == 'LONG' else (entry_px - current_price) * size
+
+            self.log_to_sheets(trade_data={
+                'timestamp': datetime.now(),
+                'symbol': self.symbol,
+                'action': 'CLOSE',
+                'side': side,
+                'size': size,
+                'price': current_price,
+                'order_value': size * current_price,
+                'fee': 0,
+                'realized_pnl': pnl_amount,
+                'unrealized_pnl': 0,
+                'confidence': 0,
+                'signal_strength': 0,
+                'leverage': 0,
+                'balance': 0,
+                'reasoning': f'Emergency Take Profit ({pnl_pct:.2f}%)',
+                'status': 'EXECUTED'
+            })
+
             self.risk_manager.update_position_tracking(0, "CLOSE")
             self.last_entry_time = None
+            self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE', 'sl_percent': None}
+
+
 
     def _get_position_summary(self, account_state: dict) -> dict:
         """
