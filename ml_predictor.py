@@ -251,23 +251,21 @@ class MLPredictor:
         imbalance = features['orderbook_imbalance'].iloc[-1]
         
         if final_up > final_down: # AI判断: BUY
-            # 売り板が極端に厚い場合 (-0.3以下) はキャンセル
-            if imbalance < -0.3:
+            if imbalance < -0.6:
                 is_filtered = True
                 filter_reason = f"売り板厚過多(Imb:{imbalance:.2f})"
-                final_up = 0.0 # 強制リセット
+                final_up = 0.0 
         
         elif final_down > final_up: # AI判断: SELL
-            # 買い板が極端に厚い場合 (0.3以上) はキャンセル
-            if imbalance > 0.3:
+            if imbalance > 0.6:
                 is_filtered = True
                 filter_reason = f"買い板厚過多(Imb:{imbalance:.2f})"
-                final_down = 0.0 # 強制リセット
+                final_down = 0.0
 
         # BTC相関フィルター
         # BTCが急落中 (-0.5%以下) にETHの買いを入れるのは危険
         btc_trend = features['btc_correlation'].iloc[-1]
-        if final_up > final_down and btc_trend < -0.5:
+        if final_up > final_down and btc_trend < -1.0:
              is_filtered = True
              filter_reason = f"BTC急落中({btc_trend:.2f}%)"
              final_up = 0.0
@@ -291,7 +289,8 @@ class MLPredictor:
             'down_prob': final_down,
             'confidence': int(confidence),
             'model_used': model_name,
-            'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f} {filter_reason}"
+            'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f} {filter_reason}",
+            'filter_reason': filter_reason
         }
 
     def evaluate_model(self, model, X_val, y_val, model_type='lgb'):

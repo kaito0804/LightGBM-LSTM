@@ -1,5 +1,5 @@
 # google_sheets_logger.py
-# Google Sheetsへの取引ログ記録・可視化システム（リニューアル版・降順記録）
+# Google Sheetsへの取引ログ記録・可視化システム（リニューアル版・降順記録・色塗り対応）
 
 import os
 import time
@@ -212,8 +212,54 @@ class GoogleSheetsLogger:
             sheet = self.spreadsheet.worksheet(sheet_name)
             rows = list(self.buffer[buffer_key])
             rows.reverse() # 新しい順にする
+            
+            # 書き込み
             sheet.insert_rows(rows, row=2, value_input_option='USER_ENTERED')
+            
+            # === AI分析シートの場合の色塗り処理 (追加) ===
+            if buffer_key == 'ai_analysis':
+                self._apply_ai_formatting(sheet, rows)
+
             self.buffer[buffer_key].clear()
+            
+    def _apply_ai_formatting(self, sheet, rows):
+        """AI分析シートの条件付き色塗り"""
+        try:
+            formats = []
+            for i, row_data in enumerate(rows):
+                # headers: ["日時", "現在価格", "AI判断", ...] -> Index 2
+                action = row_data[2]
+                
+                if action != 'HOLD':
+                    # 色の決定 (RGB 0.0-1.0)
+                    if action == 'BUY' or action == 'STRONG_BUY':
+                            # 薄い青 (Light Cyan)
+                            color = {"red": 0.85, "green": 0.95, "blue": 1.0}
+                    elif action == 'SELL' or action == 'STRONG_SELL':
+                            # 薄い赤 (Light Red)
+                            color = {"red": 1.0, "green": 0.85, "blue": 0.85}
+                    else:
+                            # その他 (WAIT, CLOSE等): 薄い黄色
+                            color = {"red": 1.0, "green": 1.0, "blue": 0.9}
+                    
+                    # 範囲計算 (A列〜L列)
+                    # 挿入された行は row=2 から始まる
+                    row_idx = 2 + i
+                    rng = f"A{row_idx}:L{row_idx}"
+                    
+                    formats.append({
+                        "range": rng,
+                        "format": {
+                            "backgroundColor": color
+                        }
+                    })
+            
+            if formats:
+                # バッチ処理で色を一括適用
+                sheet.batch_format(formats)
+                
+        except Exception as e:
+            print(f"⚠️ シート色塗りエラー (無視して続行): {e}")
 
     def force_flush(self):
         """バッファを書き込み（新しい順に上に追加）"""
@@ -235,8 +281,13 @@ if __name__ == "__main__":
     # テスト
     logger = GoogleSheetsLogger()
     print(f"URL: {logger.get_spreadsheet_url()}")
-    # テストデータ追加（最新順になるか確認）
-    logger.log_equity({'timestamp': datetime.now(), 'account_value': 1000, 'available_balance': 1000, 'position_value':0, 'unrealized_pnl':0, 'realized_pnl_cumulative':0})
-    time.sleep(1)
-    logger.log_equity({'timestamp': datetime.now(), 'account_value': 1001, 'available_balance': 1001, 'position_value':0, 'unrealized_pnl':0, 'realized_pnl_cumulative':0})
+    # テストデータ
+    logger.log_ai_analysis({
+        'timestamp': datetime.now(), 'price': 3000, 'action': 'BUY', 'confidence': 80,
+        'up_prob': 0.8, 'down_prob': 0.2, 'market_regime': 'TREND', 'model_used': 'LGBM'
+    })
+    logger.log_ai_analysis({
+        'timestamp': datetime.now(), 'price': 3005, 'action': 'HOLD', 'confidence': 20,
+        'up_prob': 0.4, 'down_prob': 0.4, 'market_regime': 'RANGE', 'model_used': 'LGBM'
+    })
     logger.force_flush()

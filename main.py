@@ -1,4 +1,4 @@
-# main.py (デイトレード最適化版)
+# main.py (デイトレード最適化・緩和版 + 理由可視化)
 # Hyperliquid 自動トレーディングボット (Google Sheets統合版 - Gemini API使用)
 
 import os
@@ -81,7 +81,7 @@ class TradingBot:
         self.last_oi = 0.0
         
         print("\n" + "="*70)
-        print(f"🚀 Hyperliquid {self.bot_name} Bot (DayTrade Logic)")
+        print(f"🚀 Hyperliquid {self.bot_name} Bot (DayTrade Aggressive Mode)")
         print("="*70)
 
 
@@ -90,7 +90,7 @@ class TradingBot:
         """
         【デイトレ・高頻度版】
         - 閾値を下げてエントリー回数を増やす
-        - バグ修正: 変数スコープと戻り値の安全性確保
+        - トレンドフィルター撤廃・逆張り許可
         """
         try:
             # === ステップ1: データ取得 (15分足) ===
@@ -163,10 +163,9 @@ class TradingBot:
             signal_score = market_analysis.get('signal_strength', 50)
 
             # スコア50を基準に ±調整 (例: 70点なら+2%、30点なら-2%)
-            # 係数 0.001 は影響度を調整 (1点あたり0.1%の影響)
             score_adjust = (signal_score - 50) * 0.001 
             
-            # 上昇確率に加算、下落確率からは減算 (整合性を保つため)
+            # 上昇確率に加算、下落確率からは減算
             adjusted_up_prob += score_adjust
             adjusted_down_prob -= score_adjust
             
@@ -191,32 +190,29 @@ class TradingBot:
                     reasoning = 'TimeExit: 2時間経過'
 
             else:
-                # === 新規エントリーロジック ===
+                # === 新規エントリーロジック (緩和版) ===
                 
                 # 動的閾値計算
                 threshold_adj  = fast_imbalance * 0.20
                 buy_threshold  = BASE_THRESHOLD - threshold_adj
                 sell_threshold = BASE_THRESHOLD + threshold_adj
 
-                # --- トレンド判定を変数として先に計算 ---
-                # これにより if文の中で変数が定義されないエラーを防ぐ
-                is_trend_ok_buy = (current_price > sma_50)
-                is_trend_ok_sell = (current_price < sma_50)
-                can_buy = is_trend_ok_buy or (rsi < 30)
-
+                # --- 緩和: トレンドフィルター撤廃・RSI範囲拡大 ---
+                # is_trend_ok_buy ... (削除)
+                
+                # RSI < 75 (少しの過熱なら許容)
                 if (adjusted_up_prob >= buy_threshold and 
                     adjusted_up_prob > adjusted_down_prob and 
-                    rsi < 70 and 
-                    can_buy):
+                    rsi < 75): 
                     
                     action = 'BUY'
                     side = 'LONG'
                     reasoning = f'BUY: 予測{adjusted_up_prob*100:.1f}% > 閾値{buy_threshold*100:.1f}% [板:{fast_imbalance:.2f}]'
                 
+                # RSI > 25 (少しの売られすぎなら許容)
                 elif (adjusted_down_prob >= sell_threshold and 
                       adjusted_down_prob > adjusted_up_prob and 
-                      rsi > 30 and 
-                      is_trend_ok_sell):
+                      rsi > 25):
                       
                     action = 'SELL'
                     side = 'SHORT'
@@ -252,14 +248,14 @@ class TradingBot:
                 'stop_loss_percent': sl_pct,
                 'take_profit_percent': tp_pct,
                 'reasoning': f"{reasoning} | {ml_result['model_used']}",
-                'ml_probabilities': {'up': up_prob, 'down': down_prob}
+                'ml_probabilities': {'up': up_prob, 'down': down_prob},
+                'filter_reason': ml_result.get('filter_reason') # ★理由を受け渡す
             }
             
         except Exception as e:
             print(f"⚠️ ML判断エラー: {e}")
             import traceback
             traceback.print_exc()
-            # エラー時も 'ml_probabilities' を含めた辞書を返す
             return {
                 'action': 'HOLD', 
                 'side': 'NONE', 
@@ -316,16 +312,37 @@ class TradingBot:
                 
         except Exception as e:
             print(f"⚠️ Google Sheetsログ記録エラー: {e}")
-            
 
-    
+    def _log_cancel_reason(self, decision, current_price, analysis, reason_text):
+        """
+        ★追加: トレード拒否（キャンセル）時の理由をログに記録するヘルパー
+        """
+        atr_pct = (analysis.get('indicators', {}).get('atr', 0) / current_price * 100) if current_price > 0 else 0
+        
+        signal_log = {
+            'timestamp': datetime.now(),
+            'symbol': self.symbol,
+            'action': 'WAIT', # キャンセルなのでWAIT扱い
+            'confidence': decision.get('confidence', 0),
+            'ml_probabilities': decision.get('ml_probabilities', {}),
+            'price': current_price,
+            'volatility': atr_pct,
+            'rsi': analysis.get('indicators', {}).get('rsi', 0),
+            'market_regime': decision.get('market_regime', 'NORMAL'),
+            'model_used': decision.get('reasoning', '').split('|')[-1].strip(),
+            'price_diff': '-',
+            'prediction_result': f"⛔ {reason_text}" # 理由をここに明記
+        }
+        self.log_to_sheets(signal_data=signal_log)
+
+
     def execute_trade(self, decision: dict, current_price: float, account_state: dict, analysis: dict):
         """
         実際の取引を実行してGoogle Sheetsに記録
         """
         action = decision.get('action')
 
-        # === 1. EV/RRチェック (手数料考慮版) ===
+        # === 1. EV/RRチェック (手数料考慮版・緩和) ===
         ev = float(decision.get('expected_value_r', 0))
         rr_ratio = float(decision.get('risk_reward_ratio', 0))
         
@@ -334,11 +351,17 @@ class TradingBot:
         net_ev = ev - ESTIMATED_COST_PCT
 
         if action in ['BUY', 'SELL']:
-            if net_ev <= 0.3: 
-                print(f"🛑 取引拒否: 手数料負けリスク (Net EV: {net_ev:.2f}%)")
+            # 【緩和】0.3% -> 0.05%
+            if net_ev <= 0.05: 
+                reason = f"EV不足(Net:{net_ev:.2f}%)"
+                print(f"🛑 取引拒否: {reason}")
+                self._log_cancel_reason(decision, current_price, analysis, reason)
                 return
-            if rr_ratio < 1.2:
-                print(f"🛑 取引拒否: リスクリワード比不足 (RR: {rr_ratio:.2f})")
+            # 【緩和】1.2 -> 0.8
+            if rr_ratio < 0.8:
+                reason = f"RR不足({rr_ratio:.2f})"
+                print(f"🛑 取引拒否: {reason}")
+                self._log_cancel_reason(decision, current_price, analysis, reason)
                 return
         
         # === 2. アカウント情報・既存ポジション一括取得 ===
@@ -349,14 +372,15 @@ class TradingBot:
         
         self.risk_manager.current_capital = account_value
         
-        # 再起動時などのために、ここでのポジション情報を確保しておく
         pos_data = self._get_position_summary(account_state)
         existing_position_value = pos_data['position_value']
         unrealized_pnl = pos_data['unrealized_pnl']
         
         # === 3. 日次損失制限チェック ===
         if not self.risk_manager.check_daily_loss_limit():
-            print("🛑 日次損失限度に達したため取引を見送ります")
+            reason = "日次損失限度到達"
+            print(f"🛑 {reason}")
+            self._log_cancel_reason(decision, current_price, analysis, reason)
             return
         
         # === 4. AI自信度を取得 ===
@@ -365,7 +389,9 @@ class TradingBot:
         # === 5. 追加ポジション可否判定 (CLOSE以外) ===
         if action != 'CLOSE' and existing_position_value > 0:
             if not self.risk_manager.should_add_position(confidence, existing_position_value):
-                print(f"⚠️ 既存ポジション${existing_position_value:.2f}あり、自信度{confidence:.0f}%では追加不可")
+                reason = "既存Posあり追加不可"
+                print(f"⚠️ {reason}")
+                self._log_cancel_reason(decision, current_price, analysis, reason)
                 return
         
         # === 6. SL/TP/Side取得 ===
@@ -405,7 +431,9 @@ class TradingBot:
             print(f"{'='*70}\n")
             
             if size == 0:
-                print(f"⚠️ ポジションサイズがゼロのため取引見送り")
+                reason = "サイズ計算結果0"
+                print(f"⚠️ {reason}")
+                self._log_cancel_reason(decision, current_price, analysis, reason)
                 return
 
         # === 8. 注文実行 ===
@@ -418,39 +446,31 @@ class TradingBot:
             trade_success = result and result.get('status') == 'ok'
             
             if trade_success:
-                # --- 詳細なトレード結果の計算と記録 ---
                 exit_price = current_price
-                
-                # メモリにない場合(再起動後など)は、APIから取得したpos_dataを使う
                 if self.trade_context['size'] > 0:
                     entry_price = self.trade_context['entry_price']
                     size_closed = self.trade_context['size']
                     side_closed = self.trade_context['side']
                     entry_reason = self.trade_context['entry_reason']
                 else:
-                    # 救済措置: メモリが消えていてもAPI情報から計算
                     entry_price = pos_data['entry_price']
                     size_closed = pos_data['size']
                     side_closed = pos_data['side']
                     entry_reason = "Unknown (Bot Restarted)" 
 
-                # 損益計算
                 if side_closed == 'LONG':
                     raw_pnl = (exit_price - entry_price) * size_closed
-                else: # SHORT
+                else: 
                     raw_pnl = (entry_price - exit_price) * size_closed
                 
-                # 手数料推定 (往復 0.07%)
                 fee_cost = (entry_price * size_closed * 0.00035) + (exit_price * size_closed * 0.00035)
                 net_pnl = raw_pnl - fee_cost
                 
-                # 経過時間
                 if self.last_entry_time:
                     duration = datetime.now() - self.last_entry_time
                 else:
                     duration = timedelta(0)
                 
-                # ログ送信
                 self.sheets_logger.log_trade_result({
                     'exit_time': datetime.now(),
                     'symbol': self.symbol,
@@ -466,14 +486,11 @@ class TradingBot:
                 
                 print(f"📝 トレード結果記録: PnL ${net_pnl:.2f}")
 
-                # コンテキストのリセット
                 self.last_entry_time = None
                 self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE'}
                 self.risk_manager.update_position_tracking(0, "CLOSE")
 
         else:
-            # --- エントリー注文 ---
-            # SL/TP価格計算 (ログ表示用)
             stop_loss_price = self.risk_manager.calculate_stop_loss(current_price, side, percent=sl_percent)
             take_profit_price = self.risk_manager.calculate_take_profit(current_price, stop_loss_price, rr_ratio)
             
@@ -494,7 +511,6 @@ class TradingBot:
             
             if trade_success:
                 print("✅ 取引成功!")
-                # エントリー成功時のみコンテキストを更新する（CLOSEのロジックと分離）
                 self.trade_context = {
                     'entry_price': current_price,
                     'entry_reason': reasoning,
@@ -508,6 +524,9 @@ class TradingBot:
                 print("❌ 取引失敗")
 
         # === 9. Google Sheetsログ記録 (Executions/AI/Equity) ===
+        # ★ここでATRを計算
+        atr_pct = (analysis.get('indicators', {}).get('atr', 0) / current_price * 100) if current_price > 0 else 0
+
         self.log_to_sheets(
             trade_data={
                 'timestamp': datetime.now(),
@@ -534,7 +553,7 @@ class TradingBot:
                 'confidence': confidence,
                 'ml_probabilities': decision.get('ml_probabilities', {}),
                 'price': current_price,
-                'volatility': analysis.get('volatility', 0),
+                'volatility': atr_pct, # ★修正: ATRを使用
                 'rsi': analysis.get('indicators', {}).get('rsi', 0),
                 'market_regime': decision.get('market_regime', 'NORMAL'),
                 'model_used': decision.get('reasoning', '').split('|')[-1].strip(),
@@ -600,7 +619,7 @@ class TradingBot:
 
     def run_trading_loop(self, interval=60):
         """
-        自動取引ループ (改良版: トレード品質格付け判定付き)
+        自動取引ループ
         """
         self.running = True
         self.online_learner.start_background_learning()
@@ -669,7 +688,6 @@ class TradingBot:
                     fast_imbalance = self.ws_monitor.get_latest_imbalance()
 
                     # 3. OIの取得と変化率計算
-                    # WebSocket経由で高速・確実にOIを取得
                     current_oi = self.ws_monitor.get_latest_oi()
                     if current_oi == 0:
                         current_oi = self.market_data.get_open_interest()
@@ -678,42 +696,30 @@ class TradingBot:
                     if self.last_oi > 0:
                         oi_delta_pct = ((current_oi - self.last_oi) / self.last_oi) * 100
                     
-                    # 変化がない(0.0)場合は、取得失敗等の可能性もあるため更新しない手もありだが、
-                    # ここでは常に最新を正とする
                     if current_oi > 0:
                         self.last_oi = current_oi
                     
                     if analysis:
                         # --- ATRベースの高感度ボラティリティ判定 ---
-                        
-                        # 1. メイン時間軸(15m)のデータを直接取得
                         tf_data = analysis['timeframes'].get(MAIN_TIMEFRAME, {})
                         atr_val = tf_data.get('atr', 0)
                         
-                        # 2. ATRをパーセンテージに変換 (ATR / 価格 * 100)
-                        # ※ ATRは「平均的な足の実体+ヒゲの長さ」を示すため、これが極端に小さいと利益が出ない
                         if current_price > 0:
                             atr_pct = (atr_val / current_price) * 100
                         else:
                             atr_pct = 0.0
 
-                        # 参考用に従来のVolも取得（ログ表示用）
                         volatility = analysis.get('volatility', 0)
 
                         print(f"   ATR(15m): {atr_pct:.3f}% (${atr_val:.2f}) | StdVol(15m): {volatility:.2f}%")
                         print(f"   Imb: {fast_imbalance:.2f} | OI: {current_oi:.0f} | OI Δ: {oi_delta_pct:+.4f}%")
 
                         # 3. 閾値判定
-                        # 15分足で価格の0.3%も動かない(例: $3000のETHで$9未満)なら、
-                        # スプレッドと手数料で負けるため待機する。
                         MIN_ATR_LIMIT = 0.3 
                         
                         if atr_pct < MIN_ATR_LIMIT:
                             status_msg = f"💤 低ボラティリティ待機 (ATR: {atr_pct:.3f}% < {MIN_ATR_LIMIT}%)"
                             print(status_msg)
-                            
-                            # ただしログが埋まるのを防ぐため、1時間に1回程度にするなどの工夫推奨
-                            # self.log_to_sheets(signal_data={'action': 'WAIT', 'reasoning': status_msg, ...})
                             last_ai_check_time = current_time 
                             time.sleep(fast_interval)
                             continue
@@ -731,6 +737,10 @@ class TradingBot:
                             # === 変数初期化 ===
                             prediction_result = "⏳ 判定待ち" 
                             price_diff_str = "-"
+                            
+                            # ★追加: フィルタリング理由があれば表示
+                            if decision.get('filter_reason'):
+                                prediction_result = f"⛔ {decision['filter_reason']}"
 
                             # 1. 現在の予測を履歴に追加
                             self.prediction_history.append({
@@ -741,17 +751,13 @@ class TradingBot:
                                 'confidence': confidence
                             })
 
-                            # 2. 15分以上前のデータを探して検証
+                            # 2. 15分以上前のデータを探して検証 (省略: 元コードと同じロジック)
                             while len(self.prediction_history) > 0:
                                 old_data = self.prediction_history[0]
                                 time_diff = current_time - old_data['timestamp']
-                                
-                                if time_diff < 900: # 15分未満なら終了
-                                    break
+                                if time_diff < 900: break
                                 
                                 target_data = self.prediction_history.popleft()
-                                
-                                # --- 答え合わせロジック (格付け機能付き) ---
                                 past_price = target_data['price']
                                 past_conf = target_data.get('confidence', 0)
                                 price_change = current_price - past_price
@@ -760,34 +766,23 @@ class TradingBot:
                                 
                                 past_up = target_data['up_prob']
                                 past_down = target_data['down_prob']
-                                
-                                # トレード対象になるレベルだったか？ 
                                 is_trade_level = (past_conf >= 50)
-
                                 result_label = "⚪️ Draw"
                                 
-                                # AI予測: 上昇
                                 if past_up > past_down:
                                     if price_change > 0:
-                                        # 的中
                                         if is_trade_level: result_label = f"🏆 トレード勝利 (Conf:{past_conf:.0f})"
                                         else: result_label = "✅ 方向正解 (見送り)"
                                     else:
-                                        # ハズレ
                                         if is_trade_level: result_label = f"💀 トレード敗北 (Conf:{past_conf:.0f})"
                                         else: result_label = "❌ 方向不正解"
-                                
-                                # AI予測: 下落
                                 elif past_down > past_up:
                                     if price_change < 0:
-                                        # 的中
                                         if is_trade_level: result_label = f"🏆 トレード勝利 (Conf:{past_conf:.0f})"
                                         else: result_label = "✅ 方向正解 (見送り)"
                                     else:
-                                        # ハズレ
                                         if is_trade_level: result_label = f"💀 トレード敗北 (Conf:{past_conf:.0f})"
                                         else: result_label = "❌ 方向不正解"
-                                
                                 prediction_result = result_label
                                 break
 
@@ -803,7 +798,7 @@ class TradingBot:
                                 'confidence': confidence,
                                 'ml_probabilities': decision.get('ml_probabilities'),
                                 'price': current_price,
-                                'volatility': volatility,
+                                'volatility': atr_pct, # ★修正: ATRを使用
                                 'rsi': analysis.get('indicators', {}).get('rsi', 0),
                                 'market_regime': decision.get('market_regime'),
                                 'model_used': decision.get('reasoning', '').split('|')[-1].strip(),
@@ -820,6 +815,9 @@ class TradingBot:
                                     self.execute_trade(decision, current_price, account_state, analysis)
                                 else:
                                     print(f"⏸️ 信頼度不足で見送り ({confidence:.1f}%)")
+                                    # ★追加: 信頼度不足の場合も理由を表示してログに残す
+                                    signal_log['prediction_result'] = f"⏸️ 信頼度不足(<{MIN_SIGNAL_STRENGTH})"
+                                    self.log_to_sheets(signal_data=signal_log)
                             else:
                                 self.log_to_sheets(signal_data=signal_log)
 
@@ -839,49 +837,31 @@ class TradingBot:
             self.online_learner.stop_background_learning()
             self.running = False
 
-
-
     def _check_emergency_exit(self, pos_data, current_price):
         """
-        緊急決済ロジック (改良版: 動的SL対応)
-        高速監視ループ(10秒ごと)で呼び出され、AIが設定した個別SLまたは緊急SLに達していたら即時決済する
+        緊急決済ロジック
         """
         entry_px = pos_data['entry_price']
         side = pos_data['side']
         size = pos_data['size']
         
-        # --- 1. PnL% (含み損益率) の計算 ---
         if side == 'LONG':
             pnl_pct = ((current_price - entry_px) / entry_px * 100)
         else:
             pnl_pct = ((entry_px - current_price) / entry_px * 100)
         
-        # --- 2. 損切り閾値の決定  ---
-        # execute_tradeで保存された今回のトレード専用のSL設定を取得
         mem_sl = self.trade_context.get('sl_percent', None)
-
         if mem_sl is not None:
-            # メモリ上のSLは正の値(例: 1.0)なので、負の値(-1.0)に変換して比較
             current_sl_threshold = -abs(float(mem_sl))
             sl_source = "Dynamic(AI)"
         else:
-            # メモリになければ全体設定(例: -2.0)を使用
             current_sl_threshold = EMERGENCY_SL_PCT
             sl_source = "Emergency(Global)"
 
-        # --- 3. 判定と実行 ---
-        
-        # [A] 損切り (Stop Loss)
         if pnl_pct <= current_sl_threshold:
             print(f"🚨 {sl_source} 損切り実行: {pnl_pct:.2f}% (閾値: {current_sl_threshold}%)")
-            
-            # 決済実行
             self.trader.close_position(self.symbol)
-            
-            # 損益概算（ログ用）
             pnl_amount = (current_price - entry_px) * size if side == 'LONG' else (entry_px - current_price) * size
-
-            # ログ記録
             self.log_to_sheets(trade_data={
                 'timestamp': datetime.now(),
                 'symbol': self.symbol,
@@ -900,21 +880,14 @@ class TradingBot:
                 'reasoning': f'{sl_source} Stop Loss ({pnl_pct:.2f}%)',
                 'status': 'EXECUTED'
             })
-
-            # コンテキストとリスク管理状態のリセット
             self.risk_manager.update_position_tracking(0, "CLOSE")
             self.last_entry_time = None
-            # sl_percent も含めて初期化
             self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE', 'sl_percent': None}
 
-        # [B] 利確 (Take Profit) - 全体設定のSECURE_PROFIT_TP_PCTを使用
         elif pnl_pct >= SECURE_PROFIT_TP_PCT:
             print(f"🎉 緊急利確実行: {pnl_pct:.2f}% (閾値: {SECURE_PROFIT_TP_PCT}%)")
-            
             self.trader.close_position(self.symbol)
-            
             pnl_amount = (current_price - entry_px) * size if side == 'LONG' else (entry_px - current_price) * size
-
             self.log_to_sheets(trade_data={
                 'timestamp': datetime.now(),
                 'symbol': self.symbol,
@@ -933,16 +906,13 @@ class TradingBot:
                 'reasoning': f'Emergency Take Profit ({pnl_pct:.2f}%)',
                 'status': 'EXECUTED'
             })
-
             self.risk_manager.update_position_tracking(0, "CLOSE")
             self.last_entry_time = None
             self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE', 'sl_percent': None}
 
-
-
     def _get_position_summary(self, account_state: dict) -> dict:
         """
-        ポジション情報を一括取得 (entry_priceを追加)
+        ポジション情報を一括取得
         """
         summary = {
             'size': 0.0,
