@@ -170,7 +170,7 @@ class TradingBot:
             adjusted_up_prob += score_adjust
             adjusted_down_prob -= score_adjust
             
-            if abs(score_adjust) > 0.01:
+            if abs(score_adjust) > 0.001:
                  reasoning += f" [Score補正:{score_adjust*100:+.1f}%]"
 
             # 補正後の自信度
@@ -240,6 +240,7 @@ class TradingBot:
             print(f"\n🤖 ML判断詳細 (Boosted):")
             print(f"   Model: {ml_result['model_used']}")
             print(f"   Raw Prob: Up {up_prob*100:.1f}% | Down {down_prob*100:.1f}%")
+            print(f"   Score Adj: {score_adjust*100:+.1f}% (Score: {signal_score})")
             print(f"   Action: {action} (Conf: {adjusted_confidence:.1f})")
 
             return {

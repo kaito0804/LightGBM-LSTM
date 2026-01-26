@@ -1,5 +1,10 @@
 import numpy as np
 from typing import Dict
+import numpy as np
+from typing import Dict
+import os                       
+from dotenv import load_dotenv  
+load_dotenv()                   
 
 class ImprovedSignalScoring:
     """
@@ -17,9 +22,9 @@ class ImprovedSignalScoring:
         self.rsi_moderate_overbought = 60
         
         # ボラティリティレジーム閾値 (%)
-        self.low_vol_threshold = 1.5
-        self.high_vol_threshold = 5.0
-        self.extreme_vol_threshold = 10.0 
+        self.low_vol_threshold = float(os.getenv('LOW_VOLATILITY_THRESHOLD', 0.5))
+        self.high_vol_threshold = float(os.getenv('HIGH_VOLATILITY_THRESHOLD', 2.0))
+        self.extreme_vol_threshold = float(os.getenv('EXTREME_VOLATILITY_THRESHOLD', 5.0))
     
     def calculate_normalized_macd(self, macd_hist: float, prices: np.ndarray) -> float:
         """MACDヒストグラムを価格変動率(ATR)で正規化 (-15 ~ +15)"""
