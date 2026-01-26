@@ -86,6 +86,14 @@ class ModelTrainer:
         
         # LightGBM 保存用学習
         self.predictor.train_lightgbm(X_train, y_train, X_val, y_val)
+
+        # 回帰モデルの学習 (ターゲットは future_change)
+        if 'future_change' in df.columns:
+            y_reg_train = df.iloc[:split_idx]['future_change']
+            y_reg_val = df.iloc[split_idx:]['future_change']
+            self.predictor.train_regressor(X_train, y_reg_train, X_val, y_reg_val)
+        else:
+            print("⚠️ future_change列が見つからないため、回帰モデルの学習をスキップします")
         
         # LSTM 学習 (全期間のシーケンスを使用)
         print(f"📊 LSTM学習: 全データ数={len(df)}")

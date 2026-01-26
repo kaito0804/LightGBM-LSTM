@@ -114,9 +114,35 @@ class OrderBookMonitor:
             on_error=self._on_error,
             on_close=self._on_close
         )
-        self.thread = threading.Thread(target=self.ws.run_forever)
-        self.thread.daemon = True 
+        self.running = True
+        websocket.enableTrace(False)
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
+
+
+
+    def _run_loop(self):
+        """接続が切れても再接続し続けるループ"""
+        while self.running:
+            try:
+                print(f"⚡ WS Connecting to {self.ws_url}...")
+                self.ws = websocket.WebSocketApp(
+                    self.ws_url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+                # 接続が切れるまでブロック
+                self.ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception as e:
+                print(f"⚠️ WS Connection failed: {e}")
+            
+            if self.running:
+                print("⏳ Reconnecting in 5 seconds...")
+                time.sleep(5)
+
+                
 
     def get_latest_imbalance(self):
         with self.lock:

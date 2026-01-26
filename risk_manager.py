@@ -43,6 +43,8 @@ class RiskManager:
         print(f"   初期資金: ${initial_capital:.2f}")
         print(f"   最大日次損失: {max_daily_loss*100:.0f}%")
 
+
+
     def _save_state(self):
         data = {
             "date": self.last_reset,
@@ -51,6 +53,8 @@ class RiskManager:
         }
         with open(self.state_file, 'w') as f:
             json.dump(data, f)
+
+
 
     def _load_state(self):
         if os.path.exists(self.state_file):
@@ -70,6 +74,8 @@ class RiskManager:
                         self.reset_daily_stats()
             except Exception as e:
                 print(f"⚠️ 状態読み込みエラー: {e}")
+
+
 
     def calculate_position_size_by_confidence(
         self, 
@@ -173,12 +179,16 @@ class RiskManager:
             'reasoning': reasoning
         }
     
+
+
     def calculate_position_size(self, capital, risk_percent, entry_price, stop_loss_percent=2.0):
         """互換性用"""
         return self.calculate_position_size_by_confidence(
             capital, entry_price, 60, 0, stop_loss_percent
         )['size']
     
+
+
     def update_position_tracking(self, position_value: float, action: str = "ADD"):
         if action == "ADD":
             self.current_position_value += position_value
@@ -190,6 +200,8 @@ class RiskManager:
             self.position_count = 0
             print(f"📊 ポジションクローズ")
     
+
+
     def should_add_position(self, confidence: float, current_position_value: float) -> bool:
         """追加ポジションを取るべきか判定"""
         if current_position_value == 0: return True
@@ -209,6 +221,8 @@ class RiskManager:
         else: 
             return False
     
+
+
     def calculate_stop_loss(self, entry_price, side, atr=None, percent=3.0):
         safe_percent = min(percent, 5.0) # 最大5%まで
         if side.upper() == "LONG":
@@ -217,6 +231,8 @@ class RiskManager:
             stop_loss = entry_price * (1 + safe_percent / 100)
         return round(stop_loss, 2)
     
+
+
     def calculate_take_profit(self, entry_price, stop_loss_price, risk_reward_ratio=1.5):
         risk = abs(entry_price - stop_loss_price)
         reward = risk * risk_reward_ratio
@@ -226,6 +242,8 @@ class RiskManager:
             take_profit = entry_price - reward
         return round(take_profit, 2)
     
+
+
     def check_daily_loss_limit(self):
         today = str(datetime.now().date())
         if today != self.last_reset:
@@ -238,18 +256,24 @@ class RiskManager:
                 return False
         return True
     
+
+
     def update_daily_pnl(self, pnl):
         self.daily_pnl += pnl
         self.total_pnl += pnl
         self.current_capital += pnl
         self._save_state()
     
+
+
     def reset_daily_stats(self):
         self.daily_pnl = 0.0
         self.trade_history = []
         self.last_reset = str(datetime.now().date())
         self._save_state()
     
+
+
     def get_risk_summary(self, entry_price, position_size, stop_loss, take_profit, leverage):
         risk_amount = abs(entry_price - stop_loss) * position_size
         reward_amount = abs(entry_price - take_profit) * position_size
@@ -264,6 +288,18 @@ class RiskManager:
             'risk_reward_ratio': reward_amount / risk_amount if risk_amount > 0 else 0
         }
 
+
+    def sync_position_state(self, real_position_value: float):
+        """外部（取引所）の実データと状態を同期する"""
+        # 誤差$1未満なら無視
+        if abs(self.current_position_value - real_position_value) > 1.0:
+            # print(f"🔄 Pos状態同期: {self.current_position_value:.2f} -> {real_position_value:.2f}")
+            self.current_position_value = real_position_value
+            # ポジションがないならカウントもリセット
+            if real_position_value == 0:
+                self.position_count = 0
+
+                
     def print_risk_status(self):
         print("\n" + "="*60)
         print("🛡️ リスク管理状況")

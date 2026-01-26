@@ -37,11 +37,13 @@ class MLPredictor:
         self.model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
         self.lgb_path = f"{model_dir}/lgb_{symbol}.pkl"
+        self.lgb_reg_path = f"{model_dir}/lgb_reg_{symbol}.pkl"
         self.lstm_path = f"{model_dir}/lstm_{symbol}.h5"
         
         self.model_lock = threading.Lock()
         
         self.lgb_model = None
+        self.lgb_reg_model = None
         self.lstm_model = None
         
         # 特徴量定義 (Imbalanceを追加)
@@ -157,9 +159,9 @@ class MLPredictor:
             
         return normalized.reshape(1, self.lstm_lookback, 1)
 
-    # ---------------------------------------------------------
-# MLPredictorクラス内の predict 関数を丸ごとこれに置き換えてください
-# ---------------------------------------------------------
+
+
+    
     def predict(self, df: pd.DataFrame, extra_features: dict = None) -> dict:
         """
         予測実行 (執行フィルター付き)
@@ -193,6 +195,7 @@ class MLPredictor:
         with self.model_lock:
             lgb_model = self.lgb_model
             lstm_model = self.lstm_model
+            lgb_reg_model = self.lgb_reg_model
 
         # 3. LightGBM 予測
         lgb_up = 0.0
@@ -223,6 +226,15 @@ class MLPredictor:
                 lstm_used = True
             except Exception as e:
                 print(f"⚠️ LSTM予測エラー: {e}")
+        
+        predicted_change_pct = 0.0
+        if lgb_reg_model:
+            try:
+                # 回帰モデルで予測 (出力は % 単位の変動幅)
+                reg_pred = lgb_reg_model.predict(features)
+                predicted_change_pct = float(reg_pred[0])
+            except Exception as e:
+                print(f"⚠️ LGBM回帰予測エラー: {e}")
 
         # 5. アンサンブル (確率の統合)
         if lgb_used and lstm_used:
@@ -289,9 +301,44 @@ class MLPredictor:
             'down_prob': final_down,
             'confidence': int(confidence),
             'model_used': model_name,
+            'predicted_change': predicted_change_pct,
             'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f} {filter_reason}",
             'filter_reason': filter_reason
         }
+
+
+
+    # 回帰モデルの学習メソッド
+    def train_regressor(self, X, y, X_val=None, y_val=None):
+        """
+        価格変動幅を予測する回帰モデルの学習
+        y: future_change (変動率%)
+        """
+        if not LIGHTGBM_AVAILABLE: return
+        
+        print("📊 変動幅予測モデル(Regressor)の学習を開始...")
+        params = {
+            'objective': 'regression', 
+            'metric': 'rmse', 
+            'verbose': -1, 
+            'random_state': 42,
+            'learning_rate': 0.05,
+            'num_leaves': 31
+        }
+        train_data = lgb.Dataset(X, label=y)
+        valid_sets = []
+        if X_val is not None:
+            valid_sets = [lgb.Dataset(X_val, label=y_val, reference=train_data)]
+        
+        reg_model = lgb.train(params, train_data, num_boost_round=100, valid_sets=valid_sets)
+        
+        with self.model_lock:
+            self.lgb_reg_model = reg_model
+            joblib.dump(self.lgb_reg_model, self.lgb_reg_path)
+        print("✅ 変動幅予測モデルの学習完了")
+
+
+
 
     def evaluate_model(self, model, X_val, y_val, model_type='lgb'):
         """
@@ -381,6 +428,10 @@ class MLPredictor:
         if os.path.exists(self.lgb_path) and LIGHTGBM_AVAILABLE:
             try: self.lgb_model = joblib.load(self.lgb_path)
             except Exception as e: print(f"⚠️ LGBM読み込みエラー: {e}")
+        
+        if os.path.exists(self.lgb_reg_path) and LIGHTGBM_AVAILABLE:
+            try: self.lgb_reg_model = joblib.load(self.lgb_reg_path)
+            except Exception as e: print(f"⚠️ LGBM(Reg)読み込みエラー: {e}")
 
         if os.path.exists(self.lstm_path) and KERAS_AVAILABLE:
             try: self.lstm_model = keras.models.load_model(self.lstm_path)
