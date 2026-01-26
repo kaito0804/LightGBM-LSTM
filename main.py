@@ -50,8 +50,13 @@ class TradingBot:
             'entry_price': 0.0,
             'entry_reason': '',
             'size': 0.0,
-            'side': 'NONE'
+            'side': 'NONE',
+            'sl_percent': None,
+            'tp_percent': None 
         }
+
+        # 状態保存ファイルのパス
+        self.state_file = "bot_state.json"
 
         # 機械学習予測器
         self.ml_predictor = MLPredictor(symbol=symbol)
@@ -84,9 +89,65 @@ class TradingBot:
         # OI（建玉）の変化を追跡するための変数
         self.last_oi = 0.0
         
+        # 起動時に前回の状態を復元する
+        self._load_bot_state()
+
         print("\n" + "="*70)
         print(f"🚀 Hyperliquid {self.bot_name} Bot (DayTrade Reasoning Mode)")
         print("="*70)
+
+
+
+    # -----------------------------------------------------------
+    # 状態の保存と読み込み
+    # -----------------------------------------------------------
+    def _save_bot_state(self):
+        """現在のトレード状態をJSONファイルに保存"""
+        try:
+            data = {
+                'last_entry_time': self.last_entry_time.isoformat() if self.last_entry_time else None,
+                'trade_context': self.trade_context
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f, indent=4)
+            # print("💾 Bot状態を保存しました")
+        except Exception as e:
+            print(f"⚠️ 状態保存エラー: {e}")
+    
+
+
+    def _load_bot_state(self):
+        """JSONファイルからトレード状態を復元"""
+        if not os.path.exists(self.state_file):
+            return
+
+        try:
+            with open(self.state_file, 'r') as f:
+                data = json.load(f)
+            
+            # 時刻の復元
+            if data.get('last_entry_time'):
+                self.last_entry_time = datetime.fromisoformat(data['last_entry_time'])
+            
+            # コンテキストの復元
+            if data.get('trade_context'):
+                self.trade_context = data['trade_context']
+                
+            # 実際のポジションがあるか確認し、なければリセット
+            # (ファイルには残っているが、手動決済などで消えている場合の整合性チェック)
+            account_state = self.trader.get_user_state()
+            pos_data = self._get_position_summary(account_state)
+            
+            if not pos_data['found']:
+                # ポジションがないのにデータが残っていたらクリア
+                if self.last_entry_time is not None:
+                    print("⚠️ ポジション不整合を検知: 状態をリセットします")
+                    self.last_entry_time = None
+                    self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE'}
+                    self._save_bot_state()
+            
+        except Exception as e:
+            print(f"⚠️ 状態復元エラー: {e}")
 
 
     
@@ -536,6 +597,7 @@ class TradingBot:
                 self.last_entry_time = None
                 self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE'}
                 self.risk_manager.update_position_tracking(0, "CLOSE")
+                self._save_bot_state()
 
         else:
             stop_loss_price = self.risk_manager.calculate_stop_loss(current_price, side, percent=sl_percent)
@@ -568,6 +630,7 @@ class TradingBot:
                 }
                 self.last_entry_time = datetime.now()
                 self.risk_manager.update_position_tracking(order_value, "ADD")
+                self._save_bot_state()
             else:
                 print("❌ 取引失敗")
 
@@ -623,6 +686,8 @@ class TradingBot:
             }
         )
     
+
+
     def check_daily_exit(self, account_state: dict):
         """
         日次強制リセット (日本時間 朝8:55 = UTC 23:55)
@@ -640,6 +705,7 @@ class TradingBot:
                 
                 self.trader.close_position(self.symbol)
                 self.last_entry_time = None
+                self._save_bot_state()
                 
                 # ログ記録
                 self.log_to_sheets(trade_data={
@@ -922,6 +988,7 @@ class TradingBot:
             self.risk_manager.update_position_tracking(0, "CLOSE")
             self.last_entry_time = None
             self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE', 'sl_percent': None}
+            self._save_bot_state()
 
     def _get_position_summary(self, account_state: dict) -> dict:
         """
