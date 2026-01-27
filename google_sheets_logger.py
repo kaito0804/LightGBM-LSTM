@@ -44,6 +44,8 @@ class GoogleSheetsLogger:
         self._authenticate()
         self._setup_spreadsheet()
     
+
+
     def _authenticate(self):
         """認証処理"""
         try:
@@ -55,6 +57,8 @@ class GoogleSheetsLogger:
         except Exception as e:
             print(f"❌ Google Sheets認証エラー: {e}")
             raise
+
+
 
     def _setup_spreadsheet(self):
         """スプレッドシートの準備"""
@@ -73,6 +77,8 @@ class GoogleSheetsLogger:
 
         self._ensure_sheets_exist()
 
+
+
     def _ensure_sheets_exist(self):
         """必要な3つのシートを作成・ヘッダー設定"""
         
@@ -85,6 +91,8 @@ class GoogleSheetsLogger:
 
         for title, headers in sheets_config:
             self._setup_sheet(title, headers)
+
+
 
     def _setup_sheet(self, title: str, headers: List[str]):
         """シートの作成とヘッダー設定"""
@@ -102,8 +110,9 @@ class GoogleSheetsLogger:
             # 1行目を固定
             sheet.freeze(rows=1)
 
-    # ========== ログ記録メソッド ==========
 
+
+    # ========== ログ記録メソッド ==========
     def log_execution(self, data: Dict[str, Any]):
         """実行履歴に追加"""
         row = [
@@ -119,6 +128,8 @@ class GoogleSheetsLogger:
         ]
         self.buffer['executions'].append(row)
         self._try_flush()
+
+
 
     def log_ai_analysis(self, data: Dict[str, Any]):
         """AI分析に追加"""
@@ -142,6 +153,8 @@ class GoogleSheetsLogger:
         ]
         self.buffer['ai_analysis'].append(row)
         self._try_flush()
+
+
 
     def log_equity(self, data: Dict[str, Any]):
         """資産推移に追加"""
@@ -195,8 +208,9 @@ class GoogleSheetsLogger:
         except Exception as e:
             print(f"⚠️ トレード履歴ログエラー: {e}")
             
-    # ========== バッファ処理 ==========
 
+
+    # ========== バッファ処理 ==========
     def _try_flush(self, force: bool = False):
         elapsed = time.time() - self.last_flush
         is_full = (len(self.buffer['executions']) >= 5 or 
@@ -205,6 +219,8 @@ class GoogleSheetsLogger:
         
         if force or elapsed >= self.flush_interval or is_full:
             self.force_flush()
+
+
 
     def _flush_buffer_to_sheet(self, sheet_name: str, buffer_key: str):
         """指定されたバッファの内容をシートに書き込むヘルパーメソッド"""
@@ -222,6 +238,8 @@ class GoogleSheetsLogger:
 
             self.buffer[buffer_key].clear()
             
+
+
     def _apply_ai_formatting(self, sheet, rows):
         """AI分析シートの条件付き色塗り"""
         try:
@@ -230,18 +248,21 @@ class GoogleSheetsLogger:
                 # headers: ["日時", "現在価格", "AI判断", ...] -> Index 2
                 action = row_data[2]
                 
-                if action != 'HOLD':
-                    # 色の決定 (RGB 0.0-1.0)
-                    if action == 'BUY' or action == 'STRONG_BUY':
-                            # 薄い青 (Light Cyan)
-                            color = {"red": 0.85, "green": 0.95, "blue": 1.0}
-                    elif action == 'SELL' or action == 'STRONG_SELL':
-                            # 薄い赤 (Light Red)
-                            color = {"red": 1.0, "green": 0.85, "blue": 0.85}
-                    else:
-                            # その他 (WAIT, CLOSE等): 薄い黄色
-                            color = {"red": 1.0, "green": 1.0, "blue": 0.9}
-                    
+                # 色の初期化（対象外のアクションはNoneのまま）
+                color = None
+                
+                if action == 'BUY' or action == 'STRONG_BUY':
+                    # 薄い青 (Light Cyan)
+                    color = {"red": 0.85, "green": 0.95, "blue": 1.0}
+                elif action == 'SELL' or action == 'STRONG_SELL':
+                    # 薄い赤 (Light Red)
+                    color = {"red": 1.0, "green": 0.85, "blue": 0.85}
+                elif action == 'CLOSE':
+                    # 薄い黄色
+                    color = {"red": 1.0, "green": 1.0, "blue": 0.85}
+                
+                # 色が設定された場合のみフォーマットを適用 (HOLD, WAIT等は無視)
+                if color:
                     # 範囲計算 (A列〜L列)
                     # 挿入された行は row=2 から始まる
                     row_idx = 2 + i
@@ -261,6 +282,8 @@ class GoogleSheetsLogger:
         except Exception as e:
             print(f"⚠️ シート色塗りエラー (無視して続行): {e}")
 
+
+
     def force_flush(self):
         """バッファを書き込み（新しい順に上に追加）"""
         try:
@@ -274,8 +297,12 @@ class GoogleSheetsLogger:
         except Exception as e:
             print(f"⚠️ ログ書き込みエラー: {e}")
 
+
+
     def get_spreadsheet_url(self) -> str:
         return self.spreadsheet.url if self.spreadsheet else "未接続"
+
+
 
 if __name__ == "__main__":
     # テスト

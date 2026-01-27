@@ -17,10 +17,13 @@ from ws_monitor import OrderBookMonitor
 
 load_dotenv()
 
+# トレード実行/クローズの確率閾値設定
+BASE_THRESHOLD  = float(os.getenv('BASE_THRESHOLD', '0.53'))
+CLOSE_THRESHOLD = float(os.getenv('CLOSE_THRESHOLD', '0.51'))
+
 # 緊急損切り・利確設定
 EMERGENCY_SL_PCT = float(os.getenv('EMERGENCY_STOP_LOSS', '-2.0')) # デイトレ用にタイトに設定
 SECURE_PROFIT_TP_PCT = float(os.getenv('SECURE_TAKE_PROFIT', '4.0'))
-MIN_SIGNAL_STRENGTH = int(os.getenv('MIN_SIGNAL_STRENGTH', '45'))
 
 # 時間軸設定
 MAIN_TIMEFRAME = os.getenv('MAIN_TIMEFRAME', '15m')  # デイトレードの主軸
@@ -192,10 +195,6 @@ class TradingBot:
                     if p.get('coin') == self.symbol and float(p.get('szi', 0)) != 0:
                         existing_side = 'LONG' if float(p.get('szi', 0)) > 0 else 'SHORT'
                         break
-            
-            # --- デイトレ用の閾値設定 ---
-            BASE_THRESHOLD = 0.53  
-            CLOSE_THRESHOLD = 0.51
 
             # 初期状態の設定（これがベースの理由になる）
             action = 'HOLD'
@@ -266,7 +265,8 @@ class TradingBot:
                 # === 新規エントリーロジック ===
                 
                 # 動的閾値計算
-                threshold_adj  = fast_imbalance * 0.20
+                raw_adj        = fast_imbalance * 0.08
+                threshold_adj  = max(min(raw_adj, 0.08), -0.08)
                 buy_threshold  = BASE_THRESHOLD - threshold_adj
                 sell_threshold = BASE_THRESHOLD + threshold_adj
 
@@ -890,13 +890,8 @@ class TradingBot:
                                 self.execute_trade(decision, current_price, account_state, analysis)
                             
                             elif action in ['BUY', 'SELL']:
-                                if confidence >= MIN_SIGNAL_STRENGTH:
-                                    self.execute_trade(decision, current_price, account_state, analysis)
-                                else:
-                                    print(f"⏸️ 信頼度不足で見送り ({confidence:.1f}%)")
-                                    # 信頼度不足の理由を明記
-                                    signal_log['prediction_result'] = f"⏸️ 信頼度不足(<{MIN_SIGNAL_STRENGTH})"
-                                    self.log_to_sheets(signal_data=signal_log)
+                                self.execute_trade(decision, current_price, account_state, analysis)
+
                             else:
                                 self.log_to_sheets(signal_data=signal_log)
 
