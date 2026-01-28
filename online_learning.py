@@ -24,13 +24,15 @@ class OnlineLearner:
         
         self.training_data_path = f"training_data/{symbol}_{timeframe}_training.csv"
         self.last_retrain_time = time.time()
-        self.max_rows = 5000
+        self.max_rows = 40000
         
         self.learning_thread = None
         self.is_running = False
         
         print(f"🔄 オンライン学習初期化: {timeframe}足 (間隔: {retrain_interval_hours}h)")
     
+
+
     def collect_latest_data(self, lookback_limit=500):
         """
         最新データを収集してCSVに追記
@@ -60,6 +62,8 @@ class OnlineLearner:
         combined_df.to_csv(self.training_data_path, index=False)
         
         return combined_df
+
+
     
     def retrain_models(self):
         """
@@ -136,12 +140,16 @@ class OnlineLearner:
         self.last_retrain_time = time.time()
         print(f"✨ モデル更新プロセス完了")
     
+
+
     def start_background_learning(self):
         if self.is_running: return
         self.is_running = True
         self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
         self.learning_thread.start()
         print(f"✅ バックグラウンド学習開始")
+
+
     
     def _learning_loop(self):
         while self.is_running:
@@ -156,6 +164,8 @@ class OnlineLearner:
             
             sleep_time = min(3600, max(60, remaining))
             time.sleep(sleep_time)
+
+            
 
     def stop_background_learning(self):
         self.is_running = False

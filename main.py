@@ -176,11 +176,8 @@ class TradingBot:
             # 予測不能時の早期リターン
             if ml_result.get('model_used') == 'NONE':
                 return {
-                    'action': 'HOLD', 
-                    'side': 'NONE', 
-                    'confidence': 0, 
-                    'reasoning': 'Wait: モデル未学習',
-                    'ml_probabilities': {'up': 0.0, 'down': 0.0}
+                    'action': 'HOLD', 'side': 'NONE', 'confidence': 0, 
+                    'reasoning': 'Wait: モデル未学習', 'ml_probabilities': {'up': 0.0, 'down': 0.0}
                 }
             
             # === ステップ3: 確率分布の解析 ===
@@ -196,7 +193,7 @@ class TradingBot:
                         existing_side = 'LONG' if float(p.get('szi', 0)) > 0 else 'SHORT'
                         break
 
-            # 初期状態の設定（これがベースの理由になる）
+            # 初期状態の設定
             action = 'HOLD'
             side = 'NONE'
             if existing_side:
@@ -232,44 +229,119 @@ class TradingBot:
             # 補正後の自信度
             adjusted_confidence = max(adjusted_up_prob, adjusted_down_prob) * 100
 
-            if existing_side:
-                # === 決済ロジック ===
-                if existing_side == 'LONG' and down_prob > CLOSE_THRESHOLD:
-                    action = 'CLOSE'
-                    reasoning = f'CLOSE: 下落予測優勢 ({down_prob*100:.1f}%)'
-                elif existing_side == 'SHORT' and up_prob > CLOSE_THRESHOLD:
-                    action = 'CLOSE'
-                    reasoning = f'CLOSE: 上昇予測優勢 ({up_prob*100:.1f}%)'
-                
-                # RSI加熱による早期利確
-                elif existing_side == 'LONG' and rsi > 70:
-                    action = 'CLOSE'
-                    reasoning = f'CLOSE: RSI過熱 ({rsi:.1f})'
-                elif existing_side == 'SHORT' and rsi < 30:
-                    action = 'CLOSE'
-                    reasoning = f'CLOSE: RSI売られすぎ ({rsi:.1f})'
+            # 動的閾値計算 (共通)
+            raw_adj        = fast_imbalance * 0.08
+            threshold_adj  = max(min(raw_adj, 0.08), -0.08)
+            buy_threshold  = BASE_THRESHOLD - threshold_adj
+            sell_threshold = BASE_THRESHOLD + threshold_adj
 
-                # 時間経過撤退
-                elif self.last_entry_time and (datetime.now() - self.last_entry_time).total_seconds() > 45 * 60:
-                    action = 'CLOSE'
-                    reasoning = 'CLOSE: 45分経過(時間切れ)'
+
+            if existing_side:
+                # === 決済ロジック (イベント駆動型: 15分/30分チェック) ===
                 
-                else:
-                    # ★ホールド理由の具体化
+                # 経過時間の計算
+                elapsed_minutes = (datetime.now() - self.last_entry_time).total_seconds() / 60 if self.last_entry_time else 0
+                
+                # 現在のPnL(%)を計算
+                current_pnl_pct = 0.0
+                pos_summary = self._get_position_summary(account_state)
+                if pos_summary['found']:
+                    entry_px = pos_summary['entry_price']
                     if existing_side == 'LONG':
-                        reasoning += f" (Down:{down_prob:.2f} < {CLOSE_THRESHOLD})"
+                        current_pnl_pct = (current_price - entry_px) / entry_px * 100
                     else:
-                        reasoning += f" (Up:{up_prob:.2f} < {CLOSE_THRESHOLD})"
+                        current_pnl_pct = (entry_px - current_price) / entry_px * 100
+
+                # --- 【フェーズ 4】 45分以降: タイムアップ ---
+                if elapsed_minutes > 45:
+                    action = 'CLOSE'
+                    reasoning = f'CLOSE: 45分経過 (タイムリミット)'
+
+                # --- 【フェーズ 3】 30分経過時のワンショット判定 ---
+                elif elapsed_minutes >= 30:
+                    # まだ30分チェックを行っていない場合のみ実行
+                    if not self.trade_context.get('check_30m_done', False):
+                        print(f"⏰ 30分経過: 継続審査を実行中...")
+                        
+                        # フラグを立てて保存（二度と呼ばれないようにする）
+                        self.trade_context['check_30m_done'] = True
+                        # 30分経っているので15分フラグもTrueにしておく（念のため）
+                        self.trade_context['check_15m_done'] = True
+                        self._save_bot_state()
+
+                        # 判定: 厳格な閾値 (+0.02) をクリアしているか？
+                        strict_buy_th = buy_threshold + 0.02
+                        strict_sell_th = sell_threshold + 0.02
+                        
+                        if existing_side == 'LONG' and adjusted_up_prob < strict_buy_th:
+                            action = 'CLOSE'
+                            reasoning = f'CLOSE: 30分審査落ち (Up:{adjusted_up_prob:.2f} < {strict_buy_th:.2f})'
+                        elif existing_side == 'SHORT' and adjusted_down_prob < strict_sell_th:
+                            action = 'CLOSE'
+                            reasoning = f'CLOSE: 30分審査落ち (Down:{adjusted_down_prob:.2f} < {strict_sell_th:.2f})'
+                        else:
+                            print("✅ 30分審査通過: ホールド継続")
+                            reasoning += " [30m審査済]"
+                    
+                    else:
+                        # 審査通過後のホールド期間
+                        reasoning += " [30m通過]"
+
+                # --- 【フェーズ 2】 15分経過時のワンショット判定 ---
+                elif elapsed_minutes >= 15:
+                    # まだ15分チェックを行っていない場合のみ実行
+                    if not self.trade_context.get('check_15m_done', False):
+                        print(f"⏰ 15分経過: 継続審査を実行中...")
+                        
+                        # フラグを立てる
+                        self.trade_context['check_15m_done'] = True
+                        self._save_bot_state()
+
+                        # 判定A: 含み損なら即撤退
+                        if current_pnl_pct < 0:
+                            action = 'CLOSE'
+                            reasoning = f'CLOSE: 15分審査落ち (含み損 {current_pnl_pct:.2f}%)'
+                        
+                        # 判定B: 予測確率がエントリー基準を下回っていたら撤退
+                        elif existing_side == 'LONG' and adjusted_up_prob < buy_threshold:
+                            action = 'CLOSE'
+                            reasoning = f'CLOSE: 15分審査落ち (Up:{adjusted_up_prob:.2f} < {buy_threshold:.2f})'
+                        elif existing_side == 'SHORT' and adjusted_down_prob < sell_threshold:
+                            action = 'CLOSE'
+                            reasoning = f'CLOSE: 15分審査落ち (Down:{adjusted_down_prob:.2f} < {sell_threshold:.2f})'
+                        else:
+                            print("✅ 15分審査通過: ホールド継続")
+                            reasoning += " [15m審査済]"
+                    
+                    else:
+                        # 審査通過後のホールド期間
+                        reasoning += " [15m通過]"
+
+                # --- 【フェーズ 1 & 全期間共通】 緊急・逆行監視 ---
+                else:
+                    # 0-15分、または各審査通過後の期間
+                    
+                    # RSI過熱感での利確 (常時有効)
+                    if existing_side == 'LONG' and rsi > 70:
+                        action = 'CLOSE'
+                        reasoning = f'CLOSE: RSI過熱 ({rsi:.1f})'
+                    elif existing_side == 'SHORT' and rsi < 30:
+                        action = 'CLOSE'
+                        reasoning = f'CLOSE: RSI売られすぎ ({rsi:.1f})'
+                    
+                    # 完全なドテン（逆シグナル）が出た場合は流石に逃げる
+                    elif existing_side == 'LONG' and down_prob > CLOSE_THRESHOLD + 0.05: # 少し余裕を持たせる
+                        action = 'CLOSE'
+                        reasoning = f'CLOSE: 強い逆行シグナル (Down:{down_prob*100:.1f}%)'
+                    elif existing_side == 'SHORT' and up_prob > CLOSE_THRESHOLD + 0.05:
+                        action = 'CLOSE'
+                        reasoning = f'CLOSE: 強い逆行シグナル (Up:{up_prob*100:.1f}%)'
+
+                    else:
+                        reasoning += f" | ⏳{int(elapsed_minutes)}分 (PnL:{current_pnl_pct:+.2f}%)"
 
             else:
-                # === 新規エントリーロジック ===
-                
-                # 動的閾値計算
-                raw_adj        = fast_imbalance * 0.08
-                threshold_adj  = max(min(raw_adj, 0.08), -0.08)
-                buy_threshold  = BASE_THRESHOLD - threshold_adj
-                sell_threshold = BASE_THRESHOLD + threshold_adj
-
+                # === 新規エントリーロジック (閾値計算は上で実施済み) ===
                 if (adjusted_up_prob >= buy_threshold and 
                     adjusted_up_prob > adjusted_down_prob and 
                     rsi < 75): 
@@ -287,7 +359,7 @@ class TradingBot:
                     reasoning = f'SELL: 予測{adjusted_down_prob*100:.1f}% > 閾値{sell_threshold*100:.1f}%'
                 
                 else:
-                    # ★Wait理由の具体化
+                    # Wait理由
                     max_p = max(adjusted_up_prob, adjusted_down_prob)
                     target_th = buy_threshold if adjusted_up_prob > adjusted_down_prob else sell_threshold
                     reasoning += f" (Prob:{max_p:.2f} < Th:{target_th:.2f})"
@@ -330,11 +402,8 @@ class TradingBot:
             import traceback
             traceback.print_exc()
             return {
-                'action': 'HOLD', 
-                'side': 'NONE', 
-                'confidence': 0, 
-                'reasoning': f'Error: {str(e)}',
-                'ml_probabilities': {'up': 0.0, 'down': 0.0}
+                'action': 'HOLD', 'side': 'NONE', 'confidence': 0, 
+                'reasoning': f'Error: {str(e)}', 'ml_probabilities': {'up': 0.0, 'down': 0.0}
             }
     
 
@@ -766,21 +835,46 @@ class TradingBot:
                     continue
 
                 if account_state:
-                    # 資産情報の更新
-                    cross_margin = account_state.get('crossMarginSummary', {})
-                    margin_summary = account_state.get('marginSummary', {})
-                    account_value = float(cross_margin.get('accountValue', 0)) or float(margin_summary.get('accountValue', 0))
-                    self.risk_manager.current_capital = account_value
-
-                    # リスク管理クラスと実際のポジション状況を同期
+                    self.risk_manager.current_capital = float(account_state.get('crossMarginSummary', {}).get('accountValue', 0)) or float(account_state.get('marginSummary', {}).get('accountValue', 0))
+                    
+                    # ポジション情報の取得
                     pos_data = self._get_position_summary(account_state)
-                    self.risk_manager.sync_position_state(pos_data['position_value'])
+                    
+                    # 建値ストップ (Breakeven Stop) の実装
+                    # 0-15分の間でも、利益が出たら逃げ道を確保する
+                    if pos_data['found']:
+                        entry_px = pos_data['entry_price']
+                        # 利益率(%)の計算
+                        if pos_data['side'] == 'LONG':
+                            pnl_pct = (current_price - entry_px) / entry_px * 100
+                        else:
+                            pnl_pct = (entry_px - current_price) / entry_px * 100
+                        
+                        # A. 利益が +0.2% を超えたら「建値ガード」を有効化
+                        if pnl_pct > 0.2 and not self.trade_context.get('breakeven_active'):
+                            self.trade_context['breakeven_active'] = True
+                            print(f"🔒 建値ガード発動: 利益確保モードへ移行 (現在:{pnl_pct:.2f}%)")
+                            self._save_bot_state()
 
-                    # 日次リセットチェック
+                        # B. ガード有効中に +0.10% (手数料分) を割りそうになったら決済
+                        if self.trade_context.get('breakeven_active', False) and pnl_pct < 0.10:
+                            print(f"🛡️ 建値撤退実行: 勝ち逃げ ({pnl_pct:.2f}%)")
+                            self.trader.close_position(self.symbol)
+                            
+                            # 状態リセット
+                            self.last_entry_time = None
+                            self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE'}
+                            self._save_bot_state()
+                            time.sleep(fast_interval)
+                            continue
+
+                    else:
+                        # ポジションがない場合はフラグをリセット
+                        if self.trade_context.get('breakeven_active'):
+                            self.trade_context['breakeven_active'] = False
+
+                    # 日次リセットや緊急停止チェック
                     self.check_daily_exit(account_state)
-
-                    # 緊急決済チェック
-                    pos_data = self._get_position_summary(account_state)
                     if pos_data['found']:
                         self._check_emergency_exit(pos_data, current_price)
 
@@ -838,6 +932,23 @@ class TradingBot:
                         if atr_pct < MIN_ATR_LIMIT:
                             status_msg = f"💤 低ボラティリティ待機 (ATR: {atr_pct:.3f}% < {MIN_ATR_LIMIT}%)"
                             print(status_msg)
+
+                            signal_log = {
+                                'timestamp': datetime.now(),
+                                'symbol': self.symbol,
+                                'action': 'WAIT',
+                                'confidence': 0,
+                                'ml_probabilities': {'up': 0.0, 'down': 0.0},
+                                'price': current_price,
+                                'volatility': atr_pct,
+                                'rsi': analysis.get('indicators', {}).get('rsi', 0),
+                                'market_regime': 'LOW_VOLATILITY', 
+                                'model_used': '-',
+                                'price_diff': '-',
+                                'prediction_result': status_msg 
+                            }
+                            self.log_to_sheets(signal_data=signal_log)
+
                             last_ai_check_time = current_time 
                             time.sleep(fast_interval)
                             continue

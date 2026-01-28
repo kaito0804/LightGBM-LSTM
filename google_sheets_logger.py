@@ -248,7 +248,7 @@ class GoogleSheetsLogger:
                 # headers: ["日時", "現在価格", "AI判断", ...] -> Index 2
                 action = row_data[2]
                 
-                # 色の初期化（対象外のアクションはNoneのまま）
+                # 色の初期化
                 color = None
                 
                 if action == 'BUY' or action == 'STRONG_BUY':
@@ -260,8 +260,12 @@ class GoogleSheetsLogger:
                 elif action == 'CLOSE':
                     # 薄い黄色
                     color = {"red": 1.0, "green": 1.0, "blue": 0.85}
+                else:
+                    # ★修正: WAITやHOLD等は明示的に「白」にする
+                    # (行挿入時の色引き継ぎを防ぐため)
+                    color = {"red": 1.0, "green": 1.0, "blue": 1.0}
                 
-                # 色が設定された場合のみフォーマットを適用 (HOLD, WAIT等は無視)
+                # 色設定
                 if color:
                     # 範囲計算 (A列〜L列)
                     # 挿入された行は row=2 から始まる

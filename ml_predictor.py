@@ -59,6 +59,8 @@ class MLPredictor:
         self.lstm_lookback = 60
         self.load_models()
 
+
+
     def create_features_from_history(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         履歴データから特徴量を計算 (推論用)
@@ -139,6 +141,8 @@ class MLPredictor:
         
         return latest_features
 
+
+
     def prepare_lstm_data(self, prices: np.ndarray) -> np.ndarray:
         """
         LSTM用データ作成 (対数変化率 + 正規化)
@@ -158,7 +162,6 @@ class MLPredictor:
         normalized = (window - mean) / std
             
         return normalized.reshape(1, self.lstm_lookback, 1)
-
 
 
     
@@ -228,13 +231,18 @@ class MLPredictor:
                 print(f"⚠️ LSTM予測エラー: {e}")
         
         predicted_change_pct = 0.0
-        if lgb_reg_model:
+        if self.lgb_reg_model:
             try:
                 # 回帰モデルで予測 (出力は % 単位の変動幅)
-                reg_pred = lgb_reg_model.predict(features)
+                reg_pred = self.lgb_reg_model.predict(features)
                 predicted_change_pct = float(reg_pred[0])
+                # print(f"   🔍 回帰予測値: {predicted_change_pct:.4f}%") # 動作確認できたらコメントアウト
             except Exception as e:
                 print(f"⚠️ LGBM回帰予測エラー: {e}")
+        else:
+            # モデルがない場合のみ表示（頻繁に出るならコメントアウト）
+            pass 
+            # print("   ⚠️ 回帰モデル(lgb_reg_model)がロードされていません")
 
         # 5. アンサンブル (確率の統合)
         if lgb_used and lstm_used:
@@ -425,14 +433,30 @@ class MLPredictor:
             model.save(self.lstm_path)
 
     def load_models(self):
+        # ★デバッグ: パスの確認
+        print(f"🔍 モデル読み込み開始: {self.symbol}")
+        print(f"   LGBMパス: {self.lgb_path} (存在: {os.path.exists(self.lgb_path)})")
+        print(f"   Regパス : {self.lgb_reg_path} (存在: {os.path.exists(self.lgb_reg_path)})")
+        print(f"   LSTMパス: {self.lstm_path} (存在: {os.path.exists(self.lstm_path)})")
+
         if os.path.exists(self.lgb_path) and LIGHTGBM_AVAILABLE:
-            try: self.lgb_model = joblib.load(self.lgb_path)
+            try: 
+                self.lgb_model = joblib.load(self.lgb_path)
+                print("   ✅ LGBM(分類) ロード成功")
             except Exception as e: print(f"⚠️ LGBM読み込みエラー: {e}")
+        else:
+            print("   ⚠️ LGBM(分類) スキップ (ファイルなし or ライブラリ不足)")
         
         if os.path.exists(self.lgb_reg_path) and LIGHTGBM_AVAILABLE:
-            try: self.lgb_reg_model = joblib.load(self.lgb_reg_path)
+            try: 
+                self.lgb_reg_model = joblib.load(self.lgb_reg_path)
+                print("   ✅ LGBM(回帰) ロード成功") # ★これが表示されるか確認
             except Exception as e: print(f"⚠️ LGBM(Reg)読み込みエラー: {e}")
+        else:
+            print("   ⚠️ LGBM(回帰) スキップ (ファイルなし or ライブラリ不足)")
 
         if os.path.exists(self.lstm_path) and KERAS_AVAILABLE:
-            try: self.lstm_model = keras.models.load_model(self.lstm_path)
+            try: 
+                self.lstm_model = keras.models.load_model(self.lstm_path)
+                print("   ✅ LSTM ロード成功")
             except Exception as e: print(f"⚠️ LSTM読み込みエラー: {e}")

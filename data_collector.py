@@ -224,7 +224,7 @@ class DataCollector:
         # デイトレ用 15分足
         filename = f"{self.symbol}_15m_training.csv"
         
-        df_15m = self.collect_historical_data('15m', 3000)
+        df_15m = self.collect_historical_data('15m', 10000)
         if df_15m is not None:
             path = self.save_dataset(df_15m, filename=filename)
             return {'15m': path}
