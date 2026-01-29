@@ -193,7 +193,7 @@ class DataCollector:
         
         if 'atr' in df.columns:
             atr_pct = (df['atr'] / df['close']) * 100
-            dynamic_threshold = (atr_pct * 0.35).clip(0.1, 1.5)
+            dynamic_threshold = (atr_pct * 0.20).clip(0.08, 1.2)
         else:
             dynamic_threshold = pd.Series(self.neutral_threshold, index=df.index)
 

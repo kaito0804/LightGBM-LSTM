@@ -12,7 +12,7 @@ import os
 SYMBOL_TARGET = 'ETHUSDT' # ターゲット通貨
 SYMBOL_BTC = 'BTCUSDT'    # 相関用BTC
 TIMEFRAME = '15m'         # 足（Botの設定に合わせる）
-DAYS_TO_FETCH = 365       # 取得する期間（1年分 = 約35,000本）
+DAYS_TO_FETCH = 100       # 取得する期間（1年分 = 約35,000本）
 OUTPUT_DIR = 'training_data'
 
 # 保存ファイル名（Botが読み込むファイル名に合わせる）
@@ -159,7 +159,7 @@ def calculate_features(df, df_btc):
     
     # ATRベースの動的閾値でラベル付け
     atr_pct = (df['atr'] / close) * 100
-    threshold = (atr_pct * 0.35).clip(0.1, 1.5)
+    threshold = (atr_pct * 0.20).clip(0.08, 1.2)
     
     conditions = [
         (df['future_change'] > threshold),

@@ -1,333 +1,280 @@
-import os
-import time
 import pandas as pd
 import numpy as np
-import ccxt
+import os
 import joblib
-import tensorflow as tf
-import logging
-
-# === ログ・警告の完全消去設定 ===
 import warnings
-# 特定の警告メッセージを無視
-warnings.filterwarnings("ignore", message="X does not have valid feature names")
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-# TensorFlowのログも消す
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-tf.get_logger().setLevel('ERROR')
-
 from datetime import datetime, timedelta
-# tqdm（バー）を無効化してインポート
-from tqdm import tqdm as original_tqdm
-def tqdm(*args, **kwargs):
-    kwargs['disable'] = True # バーを強制非表示
-    return original_tqdm(*args, **kwargs)
-
-from sklearn.preprocessing import StandardScaler
-from lightgbm import LGBMClassifier
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-import random
 import tensorflow as tf
-np.random.seed(42)
-random.seed(42)
-tf.random.set_seed(42)
+from tensorflow.keras.models import load_model
 
-# === 設定エリア (トレンドフォロー版) ===
-SYMBOL = 'ETH/USDT'
-TIMEFRAME = '15m'
-SPLIT_DATE = "2025-01-01 00:00:00" 
-FETCH_DAYS = 730
+# Keras / TensorFlow のログを抑制
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings("ignore")
 
-# ロジック設定
-INITIAL_BALANCE = 500
-
-# ★変更1: エントリーは厳選する
-ENTRY_THRESHOLD = 0.60 
-CONFIDENCE_THRESHOLD = 60 
-
-# ★変更2: 撤退ラインを「0.55」に引き上げ
-#  「反対方向に行く確率が55%を超えたら」初めて逃げる。
-#  (50%前後の迷っている状態なら、ポジションを握り続ける)
-CLOSE_THRESHOLD = 0.55 
-
+# === 設定 (main.py チューニング版) ===
+CSV_FILE = "backtest_data_ETH_USDT_15m.csv"
+INITIAL_CAPITAL = 500.0
 FEE_RATE = 0.00035
 
-class StrictBacktesterFixed:
-    def __init__(self):
-        self.exchange = ccxt.binance()
-        self.scaler = StandardScaler()
-        self.lgb_model = None
-        self.lstm_model = None
-        
-        self.balance = INITIAL_BALANCE
-        self.position = None
-        self.entry_price = 0
-        self.position_size = 0
-        self.entry_fee_cost = 0 # エントリー時の手数料を記憶
-        self.trades = []
+# ★修正1: エントリー基準を上げて「無駄打ち」を防ぐ
+# 0.40だとノイズを拾いすぎるため、上位数%のチャンスに絞る
+BASE_THRESHOLD = 0.44
 
-    def fetch_data(self):
-        # 保存するファイル名
-        filename = f"backtest_data_{SYMBOL.replace('/', '_')}_{TIMEFRAME}.csv"
+# 撤退ライン
+CLOSE_THRESHOLD = 0.55
+
+# フィルター設定
+MIN_VOLATILITY_PCT = 0.3
+
+class AccurateBacktester:
+    def __init__(self, csv_file):
+        self.csv_file = csv_file
+        self.feature_cols = [
+            'orderbook_imbalance', 'btc_correlation', 'btc_trend_strength',
+            'rsi', 'macd_hist', 'bb_position', 'bb_width',
+            'atr', 'volume_ratio', 'price_change_1h',
+            'price_change_4h', 'sma_20_50_ratio', 'volatility',
+            'hour_sin', 'hour_cos', 'day_of_week'
+        ]
+        try:
+            print("🧠 モデルを読み込み中...")
+            self.lgb_model = joblib.load('models/lgb_ETH.pkl')
+            self.lstm_model = load_model('models/lstm_ETH.h5', compile=False)
+        except Exception as e:
+            print(f"❌ モデル読み込みエラー: {e}")
+
+    def load_data(self):
+        print(f"📖 データ読み込み中: {self.csv_file}")
+        df = pd.read_csv(self.csv_file)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        return df
+
+    def calculate_indicators(self, df):
+        print("⚡ テクニカル指標を計算中...")
+        df = df.copy()
+        close = df['close']
         
-        # 1. すでにファイルがあるかチェック
-        if os.path.exists(filename):
-            print(f"📂 保存済みデータ ({filename}) を読み込み中...")
-            df = pd.read_csv(filename)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            # データの鮮度チェック（オプション）
-            last_date = df['timestamp'].iloc[-1]
-            print(f"   データ期間: {df['timestamp'].iloc[0]} 〜 {last_date}")
-            return df
+        # RSI
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df['rsi'] = 100 - (100 / (1 + rs))
+        df['rsi'] = df['rsi'].fillna(50)
         
-        # 2. ファイルがない場合はダウンロード
-        print(f"📥 過去 {FETCH_DAYS} 日分のデータを新規取得中...")
-        since = self.exchange.parse8601((datetime.now() - timedelta(days=FETCH_DAYS)).strftime('%Y-%m-%d %H:%M:%S'))
-        all_candles = []
-        pbar = tqdm(total=int(FETCH_DAYS * 24 * 4))
+        # MACD
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = macd - signal
         
-        while True:
-            try:
-                candles = self.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
-                if not candles: break
-                since = candles[-1][0] + 1
-                all_candles += candles
-                pbar.update(len(candles))
-                if candles[-1][0] > time.time() * 1000: break
-                time.sleep(0.1)
-            except:
-                break
-        pbar.close()
+        # BB
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std(ddof=0)
+        df['bb_position'] = (close - (sma20 - 2*std20)) / (4*std20)
+        df['bb_width'] = (4*std20) / sma20
         
-        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+        # ATR
+        tr1 = df['high'] - df['low']
+        tr2 = (df['high'] - close.shift()).abs()
+        tr3 = (df['low'] - close.shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
+        df['volatility_pct'] = (df['atr'] / close) * 100
         
-        # 3. CSVに保存
-        df.to_csv(filename, index=False)
-        print(f"💾 データを {filename} に保存しました（次回から高速化されます）")
+        # Others
+        sma50 = close.rolling(50).mean()
+        df['sma_20_50_ratio'] = (sma20 / sma50 - 1) * 100
+        df['volatility'] = close.rolling(20).std() / sma20 * 100
+        vol_ma = df['volume'].rolling(20).mean()
+        df['volume_ratio'] = df['volume'] / vol_ma.replace(0, 1)
+        df['price_change_1h'] = close.pct_change(4) * 100
+        df['price_change_4h'] = close.pct_change(16) * 100
+        df['hour_sin'] = np.sin(2 * np.pi * df['timestamp'].dt.hour / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['timestamp'].dt.hour / 24)
+        df['day_of_week'] = df['timestamp'].dt.dayofweek / 6.0
+        
+        # Fill missing
+        df['orderbook_imbalance'] = 0.0
+        df['btc_correlation'] = 0.0
+        df['btc_trend_strength'] = 0.0
+        
+        return df.fillna(0)
+
+    def predict_probs(self, df):
+        print("🧠 AI推論を実行中...")
+        X = df[self.feature_cols].values
+        lgb_probs = self.lgb_model.predict(X)
+        lgb_up = lgb_probs[:, 2]
+        lgb_down = lgb_probs[:, 0]
+        
+        closes = df['close'].values
+        returns = np.diff(np.log(closes), prepend=closes[0])
+        returns = np.nan_to_num(returns)
+        
+        window_size = 60
+        X_lstm = np.zeros((len(returns), window_size, 1))
+        
+        n_samples = len(returns) - window_size
+        strides = returns.strides + returns.strides
+        X_view = np.lib.stride_tricks.as_strided(
+            returns, shape=(n_samples, window_size), strides=strides
+        )
+        X_lstm[window_size:, :, 0] = X_view
+        X_lstm = (X_lstm - np.mean(X_lstm)) / (np.std(X_lstm) + 1e-8)
+
+        lstm_probs = self.lstm_model.predict(X_lstm, batch_size=4096, verbose=0)
+        
+        lstm_up_full = lstm_probs[:, 2]
+        lstm_down_full = lstm_probs[:, 0]
+        
+        df['up_prob'] = lgb_up * 0.6 + lstm_up_full * 0.4
+        df['down_prob'] = lgb_down * 0.6 + lstm_down_full * 0.4
         
         return df
 
-    def add_features(self, df):
-        df = df.copy()
-        df['return'] = df['close'].pct_change()
-        df['sma_20'] = df['close'].rolling(20).mean()
-        df['sma_50'] = df['close'].rolling(50).mean() # 追加
-        df['volatility'] = df['return'].rolling(20).std()
+    def run(self):
+        df = self.load_data()
         
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+        # カンニング防止: 直近120日を除外
+        df = df.iloc[:-11520]
+        print(f"📉 テスト期間: {df['timestamp'].iloc[0]} 〜 {df['timestamp'].iloc[-1]}")
         
-        # 正解ラベル: 次の足のCloseが今のCloseより高いか
-        df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+        df = self.calculate_indicators(df)
+        df = self.predict_probs(df)
         
-        return df.dropna()
-
-    def train_models(self, train_df):
-        print("\n🧠 2024年以前のデータでモデルを学習中...")
-        features = ['close', 'volume', 'sma_20', 'sma_50', 'volatility', 'rsi']
-        X = train_df[features].values
-        y = train_df['target'].values
+        print("🚀 main.py ロジック（改良版）によるシミュレーション開始...")
         
-        X_scaled = self.scaler.fit_transform(X)
+        balance = INITIAL_CAPITAL
+        position = None
+        trades = []
+        ctx = {}
         
-        print("   Training LightGBM...")
-        self.lgb_model = LGBMClassifier(n_estimators=200, learning_rate=0.05, random_state=42)
-        self.lgb_model.fit(X_scaled, y)
+        times = df['timestamp'].values
+        prices = df['close'].values
+        up_probs = df['up_prob'].values
+        down_probs = df['down_prob'].values
+        rsis = df['rsi'].values
+        vols = df['volatility_pct'].values
         
-        print("   Training LSTM...")
-        X_lstm = []
-        y_lstm = []
-        lookback = 60
-        for i in range(lookback, len(X_scaled)):
-            X_lstm.append(X_scaled[i-lookback:i])
-            y_lstm.append(y[i])
-        X_lstm = np.array(X_lstm)
-        y_lstm = np.array(y_lstm)
-        
-        model = Sequential([
-            LSTM(64, return_sequences=False, input_shape=(lookback, len(features))),
-            Dropout(0.2),
-            Dense(32, activation='relu'),
-            Dense(1, activation='sigmoid')
-        ])
-        model.compile(optimizer=Adam(learning_rate=0.0005), loss='binary_crossentropy', metrics=['accuracy'])
-        # Epochを増やしてしっかり学習
-        model.fit(X_lstm, y_lstm, epochs=10, batch_size=64, verbose=0)
-        self.lstm_model = model
-        print("✅ 学習完了")
-
-    def run_backtest(self):
-        # 1. データ準備
-        full_df = self.fetch_data()
-        full_df = self.add_features(full_df)
-        
-        split_ts = pd.to_datetime(SPLIT_DATE)
-        train_df = full_df[full_df['timestamp'] < split_ts].copy()
-        test_df = full_df[full_df['timestamp'] >= split_ts].copy()
-        
-        print(f"\n📊 データ分割結果: 学習 {len(train_df)}件 / テスト {len(test_df)}件")
-        self.train_models(train_df)
-        
-        print(f"\n🚀 {SPLIT_DATE} 以降のデータでバックテスト開始...")
-        print("⚡ 推論を高速化処理中 (数万件を一括計算します)...")
-        
-        features = ['close', 'volume', 'sma_20', 'sma_50', 'volatility', 'rsi']
-        
-        # テスト用に、直前のデータ(60本)を含めて結合
-        combined_df = pd.concat([train_df.tail(60), test_df]).reset_index(drop=True)
-        combined_features = self.scaler.transform(combined_df[features].values)
-        
-        # --- 高速化: 事前に全データを推論する ---
-        # LSTM用のデータセットを一気に作成
-        X_lstm = []
-        # テスト対象となるインデックス(60番目)から最後まで
-        for i in range(60, len(combined_df)):
-            X_lstm.append(combined_features[i-60:i])
-        X_lstm = np.array(X_lstm)
-        
-        # LightGBM用のデータセット
-        X_lgb = combined_features[60:]
-        
-        # ★ここで一括推論 (1回だけ実行するので爆速)
-        lgb_probs = self.lgb_model.predict_proba(X_lgb)[:, 1]
-        lstm_probs = self.lstm_model.predict(X_lstm, batch_size=4096, verbose=0)[:, 0]
-        
-        print("✅ 一括推論完了。シミュレーションを実行します...")
-
-        # ループ開始 (推論済みの確率を使って判定のみ行う)
-        # lgb_probs の長さは test_df と同じ
-        for i in tqdm(range(len(lgb_probs))):
-            # combined_df 上のインデックスは +60
-            current_idx = i + 60
-            row = combined_df.iloc[current_idx]
-            timestamp = row['timestamp']
+        for i in range(60, len(df)):
+            ts = times[i]
+            price = prices[i]
+            up_prob = up_probs[i]
+            down_prob = down_probs[i]
+            rsi = rsis[i]
+            vol_pct = vols[i]
             
-            if timestamp < split_ts: continue
-
-            price = row['close']
-            volatility = row['volatility']
-            
-            # ★ 事前計算した確率を取り出すだけ (計算コストゼロ)
-            lgb_prob = lgb_probs[i]
-            lstm_prob = lstm_probs[i]
-            
-            up_prob = (lgb_prob + lstm_prob) / 2
-            down_prob = 1.0 - up_prob
-            confidence = max(up_prob, down_prob) * 100
-            
-            # --- ロジック実行 ---
-            if volatility > 0.03: sl_pct, tp_pct = 0.02, 0.06
-            else: sl_pct, tp_pct = 0.015, 0.03 # ★変更: SLを少し広げる (0.01 -> 0.015)
+            # SL/TP 設定 (main.py準拠)
+            if vol_pct > 3.0:
+                sl_pct, tp_pct = 0.02, 0.035
+            else:
+                sl_pct, tp_pct = 0.01, 0.02
                 
             action = 'HOLD'
-            reason = ""
+            reason = ''
             
-            # 各種テクニカル指標の取得
-            sma_50_val = row['sma_50']
-            rsi_val = row['rsi'] # ★追加
+            # === ポジション管理 ===
+            if position:
+                elapsed_min = (ts - position['entry_time']) / np.timedelta64(1, 'm')
+                entry_price = position['entry_price']
+                side = position['side']
+                
+                if side == 'LONG': pnl_pct = (price - entry_price) / entry_price
+                else: pnl_pct = (entry_price - price) / entry_price
+                
+                # --- 時間経過判定 (修正版) ---
+                
+                # 【フェーズ4】45分経過: タイムアップ（デイトレなのでこれは維持）
+                if elapsed_min > 45:
+                    action = 'CLOSE'
+                    reason = 'TimeLimit 45m'
+                
+                # 【フェーズ3】30分経過: 審査を緩和
+                elif elapsed_min >= 30:
+                    if not ctx.get('check_30m'):
+                        ctx['check_30m'] = True
+                        # ★修正: 厳格審査(+0.02)をやめ、基準値(0.44)を割っていなければOKとする
+                        if side == 'LONG' and up_prob < BASE_THRESHOLD:
+                            action = 'CLOSE'; reason = '30m Check Failed'
+                        elif side == 'SHORT' and down_prob < BASE_THRESHOLD:
+                            action = 'CLOSE'; reason = '30m Check Failed'
+                
+                # 【フェーズ2】15分経過: 「Prob Drop」による撤退を廃止
+                # エントリー直後のノイズで狩られるのを防ぐため、何もチェックしない
+                
+                # --- 常時監視 ---
+                if pnl_pct <= -sl_pct: action = 'CLOSE'; reason = 'SL'
+                elif pnl_pct >= tp_pct: action = 'CLOSE'; reason = 'TP'
+                
+                # 強い逆シグナルが出たら逃げる (0.60以上に設定して簡単には逃げない)
+                if side == 'LONG' and down_prob > 0.60:
+                    action = 'CLOSE'; reason = 'Strong Reversal'
+                elif side == 'SHORT' and up_prob > 0.60:
+                    action = 'CLOSE'; reason = 'Strong Reversal'
             
-            # 決済判定
-            if self.position == 'LONG':
-                pnl_pct = (price - self.entry_price) / self.entry_price
-                if down_prob > CLOSE_THRESHOLD: action = 'CLOSE'; reason = "AI撤退"
-                elif pnl_pct <= -sl_pct: action = 'CLOSE'; reason = "損切り"
-                elif pnl_pct >= tp_pct: action = 'CLOSE'; reason = "利確"
-            
-            elif self.position == 'SHORT':
-                pnl_pct = (self.entry_price - price) / self.entry_price
-                if up_prob > CLOSE_THRESHOLD: action = 'CLOSE'; reason = "AI撤退"
-                elif pnl_pct <= -sl_pct: action = 'CLOSE'; reason = "損切り"
-                elif pnl_pct >= tp_pct: action = 'CLOSE'; reason = "利確"
+            # === 新規エントリー判定 ===
+            elif position is None and balance > 10:
+                if vol_pct < MIN_VOLATILITY_PCT: continue 
+                
+                # ★修正: 期待値フィルターを少し甘くしてエントリーしやすくする
+                max_prob = max(up_prob, down_prob)
+                if max_prob < BASE_THRESHOLD: continue
 
-            # 新規エントリー
-            if self.position is None and self.balance > 10:
-                if confidence >= CONFIDENCE_THRESHOLD:
-                    # ★修正: RSIフィルターを追加
-                    # 上昇予測 & SMAより上 & 「買われすぎ(70)ではない」
-                    if up_prob >= ENTRY_THRESHOLD and price > sma_50_val and rsi_val < 70:
-                        action = 'BUY'
-                    # 下落予測 & SMAより下 & 「売られすぎ(30)ではない」
-                    elif down_prob >= ENTRY_THRESHOLD and price < sma_50_val and rsi_val > 30:
-                        action = 'SELL'
+                # エントリーシグナル
+                if (up_prob >= BASE_THRESHOLD and up_prob > down_prob and rsi < 75):
+                    action = 'BUY'
+                elif (down_prob >= BASE_THRESHOLD and down_prob > up_prob and rsi > 25):
+                    action = 'SELL'
             
-            # 実行
-            if action == 'BUY' and self.position is None:
-                self._entry('LONG', price, timestamp)
-            elif action == 'SELL' and self.position is None:
-                self._entry('SHORT', price, timestamp)
-            elif action == 'CLOSE' and self.position is not None:
-                self._close(price, timestamp, reason)
-
-        self._print_result()
-
-    def _entry(self, side, price, timestamp):
-        self.position = side
-        self.entry_price = price
-        self.position_size = (self.balance / price)
-        fee = self.balance * FEE_RATE
-        self.entry_fee_cost = fee # ★手数料を記録
-        self.balance -= fee
-    
-    def _close(self, price, timestamp, reason):
-        value = self.position_size * price
-        raw_pnl = 0
-        if self.position == 'LONG': raw_pnl = value - (self.position_size * self.entry_price)
-        else: raw_pnl = (self.position_size * self.entry_price) - value
-        
-        exit_fee = value * FEE_RATE
-        # ★純損益 = 粗利 - (エントリー手数料 + 決済手数料)
-        net_pnl = raw_pnl - exit_fee - self.entry_fee_cost
-        
-        self.balance += (raw_pnl - exit_fee)
-        
-        self.trades.append({
-            'time': timestamp, 
-            'pnl': net_pnl, # ★正しい純損益を記録
-            'reason': reason, 
-            'balance': self.balance
-        })
-        self.position = None
-        self.position_size = 0
-        self.entry_fee_cost = 0
-
-    def _print_result(self):
-        print("\n" + "="*50)
-        print("📊 修正版・厳密なバックテスト結果")
-        print(f"   期間: {SPLIT_DATE} 〜 現在")
-        print("="*50)
-        if not self.trades:
-            print("取引なし")
-            return
+            # === 執行 ===
+            if action == 'CLOSE' and position:
+                sz = position['size']
+                if position['side'] == 'LONG': raw_pnl = (price - position['entry_price']) * sz
+                else: raw_pnl = (position['entry_price'] - price) * sz
+                
+                fee = (price * sz) * FEE_RATE
+                net_pnl = raw_pnl - fee
+                balance += (raw_pnl + (position['entry_price']*sz)) - (position['entry_price']*sz)
+                balance += net_pnl
+                
+                trades.append({'pnl': net_pnl, 'reason': reason})
+                position = None
             
-        df = pd.DataFrame(self.trades)
-        wins = df[df['pnl'] > 0]
-        total = len(df)
-        if total > 0:
-            win_rate = len(wins) / total * 100
-        else:
-            win_rate = 0
-            
-        profit = df['pnl'].sum()
+            elif action in ['BUY', 'SELL'] and position is None:
+                usd_size = balance * 0.95
+                sz = usd_size / price
+                fee = usd_size * FEE_RATE
+                balance -= fee
+                position = {'side': 'LONG' if action == 'BUY' else 'SHORT', 'size': sz, 'entry_price': price, 'entry_time': ts}
+                ctx = {}
+
+        # 結果表示
+        print("\n" + "="*60)
+        print("📊 main.py 改良版バックテスト結果")
+        print("="*60)
         
-        print(f"初期資金: ${INITIAL_BALANCE}")
-        print(f"最終資金: ${self.balance:.2f}")
-        print(f"純損益: ${profit:.2f}")
-        print(f"勝率: {win_rate:.2f}% ({len(wins)}/{total})")
-        print(f"取引回数: {total}回")
-        print("-" * 50)
-        print(df['reason'].value_counts())
-        print("="*50)
+        if not trades:
+            print("取引なし"); return
+
+        df_trades = pd.DataFrame(trades)
+        total_profit = balance - INITIAL_CAPITAL
+        win_trades = df_trades[df_trades['pnl'] > 0]
+        
+        print(f"初期資金: ${INITIAL_CAPITAL:.2f}")
+        print(f"最終資金: ${balance:.2f}")
+        print(f"純損益  : ${total_profit:.2f} ({total_profit/INITIAL_CAPITAL*100:+.2f}%)")
+        print("-" * 30)
+        print(f"総取引数: {len(df_trades)}回")
+        print(f"勝率    : {len(win_trades)/len(df_trades)*100:.1f}%")
+        print("-" * 30)
+        print("理由別決済:")
+        print(df_trades['reason'].value_counts())
+        print("="*60)
+        df_trades.to_csv("accurate_backtest_result.csv", index=False)
 
 if __name__ == "__main__":
-    tester = StrictBacktesterFixed()
-    tester.run_backtest()
+    tester = AccurateBacktester(CSV_FILE)
+    tester.run()

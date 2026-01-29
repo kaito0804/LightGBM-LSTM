@@ -18,7 +18,7 @@ from ws_monitor import OrderBookMonitor
 load_dotenv()
 
 # トレード実行/クローズの確率閾値設定
-BASE_THRESHOLD  = float(os.getenv('BASE_THRESHOLD', '0.53'))
+BASE_THRESHOLD  = float(os.getenv('BASE_THRESHOLD', '0.47'))
 CLOSE_THRESHOLD = float(os.getenv('CLOSE_THRESHOLD', '0.51'))
 
 # 緊急損切り・利確設定
