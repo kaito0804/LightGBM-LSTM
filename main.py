@@ -147,6 +147,7 @@ class TradingBot:
     def _evaluate_last_prediction(self, current_price: float, timeframe: str) -> str:
         """
         前回の予測が正しかったか答え合わせをする
+        (手数料 0.1% を考慮して、Holdが正解だったかを判定)
         """
         last_state = self.last_prediction_state.get(timeframe)
         if not last_state:
@@ -160,8 +161,8 @@ class TradingBot:
         # 変動率 (%)
         pct_change = (current_price - last_price) / last_price * 100
         
-        # 0.1%以上動かないとノイズとみなす
-        MOVE_THRESHOLD = 0.1
+        # 手数料目安 (往復 + スリッページ)
+        FEE_COST = 0.1
         
         result_text = "-"
 
@@ -169,27 +170,39 @@ class TradingBot:
         if last_action == 'HOLD':
             # === AIが「上昇」寄りだった場合 ===
             if up_prob > down_prob:
-                if pct_change > MOVE_THRESHOLD:
-                    # 上がった (方向は正解だがエントリーせず)
-                    result_text = f"❌ 機会損失 (Longで+{pct_change:.2f}%)"
-                elif pct_change < -MOVE_THRESHOLD:
-                    # 下がった (予測大外れ)
+                # 実際の利益(手数料引き後)
+                net_profit = pct_change - FEE_COST
+                
+                if net_profit > 0:
+                    # 手数料を引いてもプラス -> エントリーすべきだった
+                    result_text = f"❌ 機会損失 (Long利幅 +{net_profit:.2f}% ※手数料引)"
+                elif pct_change < -0.1:
+                    # 明らかに下がった
                     result_text = f"❌ 予測失敗 (上昇予想も下落 {pct_change:.2f}%)"
                 else:
-                    # 動かなかった (Wait正解)
-                    result_text = f"✅ 正解Hold (レンジ)"
+                    # 上がったが手数料負け、または微減 -> Holdで正解
+                    if pct_change >= 0:
+                        result_text = f"✅ 正解Hold (手数料負け回避 +{pct_change:.2f}%)"
+                    else:
+                        result_text = f"✅ 正解Hold (微減回避 {pct_change:.2f}%)"
 
             # === AIが「下落」寄りだった場合 ===
             else:
-                if pct_change < -MOVE_THRESHOLD:
-                    # 下がった (方向は正解だがエントリーせず)
-                    result_text = f"❌ 機会損失 (Shortで+{abs(pct_change):.2f}%)"
-                elif pct_change > MOVE_THRESHOLD:
-                    # 上がった (予測大外れ)
+                # Shortの場合、価格下落が利益 (手数料引き後)
+                net_profit = (-pct_change) - FEE_COST
+                
+                if net_profit > 0:
+                    # 手数料を引いてもプラス
+                    result_text = f"❌ 機会損失 (Short利幅 +{net_profit:.2f}% ※手数料引)"
+                elif pct_change > 0.1:
+                    # 明らかに上がった
                     result_text = f"❌ 予測失敗 (下落予想も上昇 +{pct_change:.2f}%)"
                 else:
-                    # 動かなかった
-                    result_text = f"✅ 正解Hold (レンジ)"
+                    # 下がったが手数料負け、または微増 -> Holdで正解
+                    if pct_change <= 0:
+                        result_text = f"✅ 正解Hold (手数料負け回避 {pct_change:.2f}%)"
+                    else:
+                        result_text = f"✅ 正解Hold (微増回避 +{pct_change:.2f}%)"
 
         # ケースB: 前回 BUY だった場合
         elif last_action == 'BUY':
