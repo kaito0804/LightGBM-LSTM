@@ -26,13 +26,15 @@ except ImportError:
     KERAS_AVAILABLE = False
 
 class MLPredictor:
-    def __init__(self, symbol='ETH', model_dir='models'):
+    def __init__(self, symbol='ETH', timeframe='15m', model_dir='models'):
         self.symbol = symbol
+        self.timeframe = timeframe 
         self.model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
-        self.lgb_path = f"{model_dir}/lgb_{symbol}.pkl"
-        self.lgb_reg_path = f"{model_dir}/lgb_reg_{symbol}.pkl"
-        self.lstm_path = f"{model_dir}/lstm_{symbol}.h5"
+        
+        self.lgb_path = f"{model_dir}/lgb_{symbol}_{timeframe}.pkl"
+        self.lgb_reg_path = f"{model_dir}/lgb_reg_{symbol}_{timeframe}.pkl"
+        self.lstm_path = f"{model_dir}/lstm_{symbol}_{timeframe}.h5"
         
         self.model_lock = threading.Lock()
         
@@ -40,7 +42,7 @@ class MLPredictor:
         self.lgb_reg_model = None
         self.lstm_model = None
         
-        # ★改善点: 特徴量に直近の変化(Lag)とボラティリティ比率を追加
+        # 特徴量に直近の変化(Lag)とボラティリティ比率を追加
         self.feature_cols = [
             'orderbook_imbalance',  
             'btc_correlation',      
@@ -102,7 +104,7 @@ class MLPredictor:
         df['return_lag_2'] = current_return.shift(2).fillna(0)
         df['return_lag_3'] = current_return.shift(3).fillna(0)
         
-        # Volatility Ratio (★改善点: 短期ボラ / 長期ボラ)
+        # Volatility Ratio (短期ボラ / 長期ボラ)
         # 急激に動き出した瞬間を捉える
         df['atr'] = self._calc_atr(df)
         long_term_atr = df['atr'].rolling(10).mean().replace(0, 1)
@@ -235,8 +237,7 @@ class MLPredictor:
 
         # Confidence計算
         max_prob = max(final_up, final_down)
-        confidence = (max_prob - 0.35) / (0.9 - 0.35) * 100 # 基準を少し下げてスケーリング
-        confidence = min(100, max(0, confidence))
+        confidence = max_prob * 100
 
         return {
             'action': 'PREDICTED',

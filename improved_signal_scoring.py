@@ -1,10 +1,9 @@
 import numpy as np
 from typing import Dict
-import numpy as np
-from typing import Dict
-import os                       
-from dotenv import load_dotenv  
-load_dotenv()                   
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class ImprovedSignalScoring:
     """
@@ -88,10 +87,7 @@ class ImprovedSignalScoring:
         return 0.0
     
     def calculate_trend_score(self, sma_20: float, sma_50: float, sma_200: float = None) -> float:
-        """
-        トレンドスコア (MAの並び順と乖離率)
-        ※ volatility引数は未使用だったため削除
-        """
+        """トレンドスコア (MAの並び順と乖離率)"""
         score = 0.0
         if sma_50 == 0: return 0.0
         
@@ -160,12 +156,23 @@ class ImprovedSignalScoring:
     def calculate_comprehensive_score(self, timeframe_data: Dict[str, Dict]) -> Dict:
         """
         総合スコア計算
-        DataCollector/MarketDataで計算済みの値を集約する
         """
-        # (1hだと反応が遅く、デイトレの環境認識として機能しないため)
+        # 基準となる時間軸のデータを取得 (15m優先、なければ1h)
         base_tf = timeframe_data.get('15m', {})
         if not base_tf:
             base_tf = timeframe_data.get('1h', {})
+        
+        # データが全くない場合のガード
+        if not base_tf:
+            return {
+                'signal_strength': 50,
+                'direction': 'NEUTRAL',
+                'confidence': 0,
+                'regime': 'NO_DATA',
+                'volatility': 0,
+                'trend_strength': 0,
+                'breakdown': {}
+            }
             
         volatility = base_tf.get('volatility', 2.0)
         
@@ -185,8 +192,11 @@ class ImprovedSignalScoring:
         total_weight = 0.0
         breakdown = {}
         
+        # 各時間軸のスコア計算
         for tf, data in timeframe_data.items():
-            if tf not in weights: continue
+            # 設定にない時間軸や、データが空の場合はスキップ
+            if tf not in weights or not data: 
+                continue
             
             weight = weights[tf]
             prices = data.get('prices', np.array([]))
@@ -195,13 +205,11 @@ class ImprovedSignalScoring:
             rsi_score = self.calculate_rsi_score(data.get('rsi', 50), volatility)
             
             macd_val = data.get('macd', {})
-            # 辞書型かどうかのガード
             hist = macd_val.get('histogram', 0) if isinstance(macd_val, dict) else 0
             macd_score = self.calculate_normalized_macd(hist, prices)
             
             bb_val = data.get('bollinger_bands', {})
-            # AdvancedMarketDataのキー名(bollinger_bands)に合わせる
-            if not bb_val: bb_val = data.get('bb', {}) # フォールバック
+            if not bb_val: bb_val = data.get('bb', {})
             
             bb_score = self.calculate_bb_score(
                 bb_val.get('position', 0.5),
@@ -209,17 +217,14 @@ class ImprovedSignalScoring:
                 volatility
             )
             
-            # トレンドスコア
             t_score = self.calculate_trend_score(
                 data.get('sma_20', 0),
                 data.get('sma_50', 0),
                 data.get('sma_200', None)
             )
             
-            # コンフルエンス
             conf_bonus = self.calculate_indicator_confluence(rsi_score, macd_score, bb_score)
             
-            # 合計
             tf_total = rsi_score + macd_score + bb_score + t_score + conf_bonus
             
             weighted_score += tf_total * weight
@@ -232,8 +237,11 @@ class ImprovedSignalScoring:
             }
         
         # 正規化 (0-100)
-        # weighted_scoreは概ね -50 ~ +50 の範囲になる設計
-        raw_score = weighted_score / total_weight if total_weight > 0 else 0
+        if total_weight > 0:
+            raw_score = weighted_score / total_weight
+        else:
+            raw_score = 0
+            
         final_score = max(0, min(100, 50 + raw_score))
         
         # 結果整形
@@ -241,19 +249,16 @@ class ImprovedSignalScoring:
         elif final_score < 40: direction = 'BEARISH'
         else:                  direction = 'NEUTRAL'
         
-        # 信頼度 (中心50からの乖離)
         confidence = min(100, abs(final_score - 50) * 2)
         
-        # レジーム判定
         if volatility > self.high_vol_threshold: regime = 'VOLATILE'
         elif trend_strength > 2.0:               regime = 'TRENDING'
         else:                                    regime = 'RANGING'
 
-        # 変動が少なすぎる場合は、ノイズでの損失を防ぐために強制的に「待機」とする
         if volatility < self.low_vol_threshold:
-            final_score = 50       # 強制中立
+            final_score = 50
             direction = 'NEUTRAL'
-            confidence = 0         # 自信なし
+            confidence = 0
             regime = 'LOW_VOLATILITY'
         
         return {
