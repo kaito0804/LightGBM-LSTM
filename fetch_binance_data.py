@@ -84,8 +84,10 @@ def fetch_binance_klines(symbol, interval, days):
     return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
 
 def calculate_features(df, df_btc):
-    """Botと同じロジックで特徴量を計算する"""
-    print("🛠 特徴量エンジニアリング中...")
+    """
+    Botと同じロジックで特徴量を計算する (整合性確保版)
+    """
+    print("🛠 特徴量エンジニアリング中 (Lag/Volatility追加)...")
     
     # 1. BTCデータのマージ（相関計算用）
     df = pd.merge_asof(
@@ -97,6 +99,9 @@ def calculate_features(df, df_btc):
     
     # --- テクニカル指標（Botのロジックを再現）---
     close = df['close']
+    high = df['high']
+    low = df['low']
+    volume = df['volume']
     
     # BTC相関
     df['btc_correlation'] = close.rolling(24).corr(df['close_btc']).fillna(0)
@@ -127,22 +132,40 @@ def calculate_features(df, df_btc):
     df['bb_position'] = (close - (sma20 - 2*std20)) / (4*std20)
     df['bb_width'] = (4*std20) / sma20
     
-    # ATR
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['close'].shift()).abs()
-    tr3 = (df['low'] - df['close'].shift()).abs()
+    # ATR (整合性のため計算式を統一)
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['atr'] = tr.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     
-    # その他の特徴量
+    # SMA & Volume Ratio
     df['sma_20'] = sma20
     df['sma_50'] = close.rolling(50).mean()
     df['sma_20_50_ratio'] = (df['sma_20'] / df['sma_50'] - 1) * 100
-    vol_ma = df['volume'].rolling(20).mean()
-    df['volume_ratio'] = df['volume'] / vol_ma.replace(0, 1)
-    df['price_change_1h'] = close.pct_change(4).fillna(0) * 100 # 15m * 4 = 1h
-    df['price_change_4h'] = close.pct_change(16).fillna(0) * 100 # 15m * 16 = 4h
+    
+    vol_ma = volume.rolling(20).mean()
+    df['volume_ratio'] = volume / vol_ma.replace(0, 1)
+    
+    # --- ★ここから修正・追加箇所 ---
+    # ml_predictor.py と整合性を取るため、'price_change_1h' は「1本前(15m)の変化率」とする
+    current_return = close.pct_change(1).fillna(0) * 100
+    df['price_change_1h'] = current_return
+    
+    # 4本前(本来の1h)の変化率も特徴量として残す
+    df['price_change_4h'] = close.pct_change(4).fillna(0) * 100 
+    
+    # ★Lag特徴量 (直近の勢い)
+    df['return_lag_1'] = current_return.shift(1).fillna(0)
+    df['return_lag_2'] = current_return.shift(2).fillna(0)
+    df['return_lag_3'] = current_return.shift(3).fillna(0)
+    
+    # ★Volatility Ratio (ボラティリティの拡大度)
+    long_term_atr = df['atr'].rolling(10).mean().replace(0, 1)
+    df['volatility_ratio'] = df['atr'] / long_term_atr
+    
     df['volatility'] = close.rolling(20).std() / sma20 * 100
+    # --------------------------------
     
     # 時間特徴量
     df['hour_sin'] = np.sin(2 * np.pi * df['timestamp'].dt.hour / 24)
@@ -188,12 +211,12 @@ def main():
     df_final.to_csv(OUTPUT_FILENAME, index=False)
     
     print("\n" + "="*50)
-    print(f"✅ 学習データ作成完了！")
+    print(f"✅ 学習データ作成完了 (修正版)！")
     print(f"📁 保存先: {OUTPUT_FILENAME}")
     print(f"📊 データ数: {len(df_final)} 行 (約{DAYS_TO_FETCH}日分)")
     print(f"📈 ラベル分布: {df_final['label'].value_counts().to_dict()}")
     print("="*50)
-    print("\n👉 次のステップ: 'python train_models.py' を実行してAIを学習させてください")
+    print("\n👉 次のステップ: 'python train_models.py' を実行してAIを再学習させてください")
 
 if __name__ == "__main__":
     main()

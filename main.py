@@ -18,8 +18,8 @@ from ws_monitor import OrderBookMonitor
 load_dotenv()
 
 # トレード実行/クローズの確率閾値設定
-BASE_THRESHOLD  = float(os.getenv('BASE_THRESHOLD', '0.47'))
-CLOSE_THRESHOLD = float(os.getenv('CLOSE_THRESHOLD', '0.51'))
+BASE_THRESHOLD  = float(os.getenv('BASE_THRESHOLD', '0.45'))
+CLOSE_THRESHOLD = float(os.getenv('CLOSE_THRESHOLD', '0.48'))
 
 # 緊急損切り・利確設定
 EMERGENCY_SL_PCT = float(os.getenv('EMERGENCY_STOP_LOSS', '-2.0')) # デイトレ用にタイトに設定
@@ -156,34 +156,34 @@ class TradingBot:
     
     def get_ml_decision(self, market_analysis: dict, account_state: dict, structure_data: dict) -> dict:
         """
-        【判定ロジック】
-        Why（理由）を明確にするためのロジック構築
+        【判定ロジック刷新版】
+        1. 期待値(EV)ベースのトレンド判定: (確率 × 予想変動幅) でエントリー
+        2. レンジ戦略の導入: 低ボラティリティ時は逆張りスキャルピング
         """
         try:
-            # === ステップ1: データ取得 (15分足) ===
+            # === データ取得 ===
             df_main = self.market_data.get_ohlcv(MAIN_TIMEFRAME, limit=200)
-            
-            # 板情報の偏りを取得
-            fast_imbalance = self.ws_monitor.get_latest_imbalance()
-            print(f"⚡ 高速板情報: {fast_imbalance:.2f}")
-
-            # OI変化率を取り出す
-            oi_delta = structure_data.get('oi_delta_pct', 0.0)
-            
-            # === ステップ2: ML予測実行 ===
             ml_result = self.ml_predictor.predict(df_main, extra_features=structure_data)
             
-            # 予測不能時の早期リターン
             if ml_result.get('model_used') == 'NONE':
-                return {
-                    'action': 'HOLD', 'side': 'NONE', 'confidence': 0, 
-                    'reasoning': 'Wait: モデル未学習', 'ml_probabilities': {'up': 0.0, 'down': 0.0}
-                }
-            
-            # === ステップ3: 確率分布の解析 ===
+                return {'action': 'HOLD', 'side': 'NONE', 'confidence': 0, 'reasoning': 'Wait: 未学習', 'ml_probabilities': {'up':0,'down':0}}
+
+            # AI予測データの展開
             up_prob = ml_result['up_prob']
             down_prob = ml_result['down_prob']
+            predicted_change = ml_result.get('predicted_change', 0.0)
             
+            # 指標と環境データ
+            indicators = market_analysis.get('indicators', {})
+            rsi = indicators.get('rsi', 50)
+            bb = indicators.get('bollinger', {})
+            current_price = market_analysis.get('price', 0)
+            
+            # ATR (ボラティリティ判定用)
+            tf_data = market_analysis['timeframes'].get(MAIN_TIMEFRAME, {})
+            atr_val = tf_data.get('atr', 0)
+            atr_pct = (atr_val / current_price * 100) if current_price > 0 else 0
+
             # 既存ポジション確認
             existing_side = None
             if account_state and 'assetPositions' in account_state:
@@ -193,49 +193,55 @@ class TradingBot:
                         existing_side = 'LONG' if float(p.get('szi', 0)) > 0 else 'SHORT'
                         break
 
-            # 初期状態の設定
             action = 'HOLD'
             side = 'NONE'
-            if existing_side:
-                reasoning = f"Hold: {existing_side}継続"
-            else:
-                reasoning = f"Wait: 様子見"
+            reasoning = f"Wait: {existing_side if existing_side else '様子見'}"
+            confidence = ml_result['confidence']
 
-            # 指標取得
-            indicators = market_analysis.get('indicators', {})
-            rsi = indicators.get('rsi', 50)
-            current_price = market_analysis.get('price', 0)
-
-            # === 1. 確率補正 (OIフィルター & ブースト) ===
-            adjusted_up_prob = up_prob
-            adjusted_down_prob = down_prob
-
-            if oi_delta < -0.05: 
-                adjusted_up_prob -= 0.05
-                adjusted_down_prob -= 0.05
-                reasoning += f" [OI減]"
-            elif oi_delta > 0.05:
-                if adjusted_up_prob > adjusted_down_prob:
-                    adjusted_up_prob += 0.03
-                elif adjusted_down_prob > adjusted_up_prob:
-                    adjusted_down_prob += 0.03
-
-            # スコア補正
-            signal_score = market_analysis.get('signal_strength', 50)
-            score_adjust = (signal_score - 50) * 0.001 
-            adjusted_up_prob += score_adjust
-            adjusted_down_prob -= score_adjust
+            # =========================================================
+            # ロジックA: 期待値(EV)ベースのトレンドフォロー (主力)
+            # =========================================================
+            # 「確率はそこそこでも、大きく動くと予想されるならGO」
             
-            # 補正後の自信度
-            adjusted_confidence = max(adjusted_up_prob, adjusted_down_prob) * 100
+            # 期待値スコア = 確率 × 予想変動率(絶対値)
+            ev_score_up = up_prob * abs(predicted_change) if predicted_change > 0 else 0
+            ev_score_down = down_prob * abs(predicted_change) if predicted_change < 0 else 0
+            
+            # 閾値設定 (経験則: 0.40(確率) * 0.3%(変動) = 0.12)
+            EV_THRESHOLD = 0.12
+            PROB_THRESHOLD = 0.38 # 最低限の確率
 
-            # 動的閾値計算 (共通)
-            raw_adj        = fast_imbalance * 0.08
-            threshold_adj  = max(min(raw_adj, 0.08), -0.08)
-            buy_threshold  = BASE_THRESHOLD - threshold_adj
-            sell_threshold = BASE_THRESHOLD + threshold_adj
+            signal_trend = "NONE"
+            
+            if up_prob > down_prob and up_prob > PROB_THRESHOLD:
+                if ev_score_up > EV_THRESHOLD or up_prob > 0.55: # EVが高いか、確率が圧倒的か
+                    signal_trend = "BUY"
+            
+            elif down_prob > up_prob and down_prob > PROB_THRESHOLD:
+                if ev_score_down > EV_THRESHOLD or down_prob > 0.55:
+                    signal_trend = "SELL"
 
+            # =========================================================
+            # ロジックB: レンジ戦略 (サブ) - 低ボラティリティ時のみ発動
+            # =========================================================
+            signal_range = "NONE"
+            is_range_env = (atr_pct < 0.25) # 0.3だと広すぎるので0.25以下をレンジと定義
 
+            if is_range_env:
+                bb_pos = bb.get('position', 0.5)
+                # 下限付近かつ売られすぎ -> 買い
+                if bb_pos < 0.1 and rsi < 35:
+                    signal_range = "BUY"
+                    reasoning = f"Range Buy: Low Vol({atr_pct:.2f}%) + RSI({rsi:.0f})"
+                # 上限付近かつ買われすぎ -> 売り
+                elif bb_pos > 0.9 and rsi > 65:
+                    signal_range = "SELL"
+                    reasoning = f"Range Sell: Low Vol({atr_pct:.2f}%) + RSI({rsi:.0f})"
+
+            # =========================================================
+            # 最終判定 & 統合
+            # =========================================================
+            
             if existing_side:
                 # === 決済ロジック (イベント駆動型: 15分/30分チェック) ===
                 
@@ -341,70 +347,65 @@ class TradingBot:
                         reasoning += f" | ⏳{int(elapsed_minutes)}分 (PnL:{current_pnl_pct:+.2f}%)"
 
             else:
-                # === 新規エントリーロジック (閾値計算は上で実施済み) ===
-                if (adjusted_up_prob >= buy_threshold and 
-                    adjusted_up_prob > adjusted_down_prob and 
-                    rsi < 75): 
-                    
-                    action = 'BUY'
-                    side = 'LONG'
-                    reasoning = f'BUY: 予測{adjusted_up_prob*100:.1f}% > 閾値{buy_threshold*100:.1f}%'
+                # --- 新規エントリー ---
+                final_signal = "NONE"
                 
-                elif (adjusted_down_prob >= sell_threshold and 
-                      adjusted_down_prob > adjusted_up_prob and 
-                      rsi > 25):
-                      
-                    action = 'SELL'
-                    side = 'SHORT'
-                    reasoning = f'SELL: 予測{adjusted_down_prob*100:.1f}% > 閾値{sell_threshold*100:.1f}%'
+                # トレンドシグナル優先
+                if signal_trend == "BUY":
+                    final_signal = "BUY"
+                    reasoning = f"Trend BUY: EV({ev_score_up:.3f}) Prob({up_prob:.2f}) Pred({predicted_change:+.2f}%)"
+                elif signal_trend == "SELL":
+                    final_signal = "SELL"
+                    reasoning = f"Trend SELL: EV({ev_score_down:.3f}) Prob({down_prob:.2f}) Pred({predicted_change:+.2f}%)"
                 
-                else:
-                    # Wait理由
-                    max_p = max(adjusted_up_prob, adjusted_down_prob)
-                    target_th = buy_threshold if adjusted_up_prob > adjusted_down_prob else sell_threshold
-                    reasoning += f" (Prob:{max_p:.2f} < Th:{target_th:.2f})"
-            
-            # === 動的リスクパラメータ ===
+                # トレンドがない場合、レンジシグナル採用
+                elif signal_range == "BUY":
+                    final_signal = "BUY"
+                    confidence = 50 # レンジは自信度中程度固定
+                elif signal_range == "SELL":
+                    final_signal = "SELL"
+                    confidence = 50
+
+                # エントリー決定
+                if final_signal == "BUY":
+                    action = "BUY"
+                    side = "LONG"
+                elif final_signal == "SELL":
+                    action = "SELL"
+                    side = "SHORT"
+
+            # === リスクパラメータ ===
             volatility = market_analysis.get('volatility', 2.0)
-            if volatility > 3.0: 
-                sl_pct, tp_pct = 2.0, 3.5 
-            else: 
-                sl_pct, tp_pct = 1.0, 2.0
+            if volatility > 3.0: sl_pct, tp_pct = 2.0, 3.5 
+            elif is_range_env: sl_pct, tp_pct = 0.8, 1.2 # レンジ時はタイトに
+            else: sl_pct, tp_pct = 1.0, 2.0
 
-            # 期待値計算
-            win_prob = adjusted_up_prob if action == 'BUY' else adjusted_down_prob if action == 'SELL' else 0.0
-            if action in ['BUY', 'SELL']:
-                expected_value_r = (win_prob * tp_pct) - ((1 - win_prob) * sl_pct)
-            else:
-                expected_value_r = 0
-
-            # ログ表示
-            print(f"\n🤖 ML判断詳細 (Boosted):")
-            print(f"   Model: {ml_result['model_used']}")
-            print(f"   Action: {action} (Conf: {adjusted_confidence:.1f})")
-            print(f"   Reason: {reasoning}")
+            # 期待値計算 (ログ用)
+            win_prob = up_prob if action == 'BUY' else down_prob
+            
+            print(f"\n🤖 ML判断詳細 (EV & Range):")
+            print(f"   Action: {action} (Conf: {confidence:.1f})")
+            print(f"   Logic: Trend={signal_trend} (EV_Up:{ev_score_up:.3f}/Down:{ev_score_down:.3f}), Range={signal_range}")
+            print(f"   Pred Change: {predicted_change:+.3f}%")
 
             return {
                 'action': action,
                 'side': side,
-                'confidence': adjusted_confidence,
-                'expected_value_r': expected_value_r,
+                'confidence': confidence,
+                'expected_value_r': (win_prob * tp_pct) - ((1 - win_prob) * sl_pct),
                 'risk_reward_ratio': tp_pct / sl_pct,
                 'stop_loss_percent': sl_pct,
                 'take_profit_percent': tp_pct,
                 'reasoning': f"{reasoning} | {ml_result['model_used']}",
                 'ml_probabilities': {'up': up_prob, 'down': down_prob},
+                'predicted_change': predicted_change,
                 'filter_reason': ml_result.get('filter_reason')
             }
             
         except Exception as e:
             print(f"⚠️ ML判断エラー: {e}")
-            import traceback
-            traceback.print_exc()
-            return {
-                'action': 'HOLD', 'side': 'NONE', 'confidence': 0, 
-                'reasoning': f'Error: {str(e)}', 'ml_probabilities': {'up': 0.0, 'down': 0.0}
-            }
+            import traceback; traceback.print_exc()
+            return {'action': 'HOLD', 'side': 'NONE', 'confidence': 0, 'reasoning': f'Error: {str(e)}', 'ml_probabilities': {'up': 0, 'down': 0}}
     
 
     

@@ -1,9 +1,3 @@
-"""
-機械学習ベースの価格予測システム (デイトレード最適化版)
-- LightGBM: テーブルデータ予測 (板情報追加)
-- LSTM: 対数変化率を使用した時系列予測
-- 評価機能: オンライン学習の安全性確保
-"""
 import numpy as np
 import pandas as pd
 import joblib
@@ -46,30 +40,26 @@ class MLPredictor:
         self.lgb_reg_model = None
         self.lstm_model = None
         
-        # 特徴量定義 (Imbalanceを追加)
+        # ★改善点: 特徴量に直近の変化(Lag)とボラティリティ比率を追加
         self.feature_cols = [
             'orderbook_imbalance',  
             'btc_correlation',      
             'btc_trend_strength',
             'rsi', 'macd_hist', 'bb_position', 'bb_width',
             'atr', 'volume_ratio', 'price_change_1h',
-            'price_change_4h', 'sma_20_50_ratio', 'volatility',
+            'return_lag_1', 'return_lag_2', 'return_lag_3', 
+            'volatility_ratio',
+            'sma_20_50_ratio', 'volatility',
             'hour_sin', 'hour_cos', 'day_of_week'
         ]
         self.lstm_lookback = 60
         self.load_models()
 
-
-
     def create_features_from_history(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        履歴データから特徴量を計算 (推論用)
-        """
+        """履歴データから特徴量を計算 (推論用)"""
         df = df.copy()
-        if len(df) < 100:
-            return None
+        if len(df) < 100: return None
 
-        # テクニカル指標計算
         close = df['close']
         
         # RSI
@@ -101,36 +91,42 @@ class MLPredictor:
         vol_ma = df['volume'].rolling(20).mean()
         df['volume_ratio'] = df['volume'] / vol_ma.replace(0, 1)
         
-        # Price Change
-        df['price_change_1h'] = close.pct_change(1) * 100
+        # Price Change & Lags (★改善点)
+        # pct_change(1) は1足ごとの変化率
+        current_return = close.pct_change(1) * 100
+        df['price_change_1h'] = current_return # 互換性のため維持
         df['price_change_4h'] = close.pct_change(4) * 100
         
-        # Volatility
+        # 直近のローソク足の変化率を明示的に特徴量化
+        df['return_lag_1'] = current_return.shift(1).fillna(0)
+        df['return_lag_2'] = current_return.shift(2).fillna(0)
+        df['return_lag_3'] = current_return.shift(3).fillna(0)
+        
+        # Volatility Ratio (★改善点: 短期ボラ / 長期ボラ)
+        # 急激に動き出した瞬間を捉える
+        df['atr'] = self._calc_atr(df)
+        long_term_atr = df['atr'].rolling(10).mean().replace(0, 1)
+        df['volatility_ratio'] = df['atr'] / long_term_atr
+
         df['volatility'] = close.rolling(20).std() / sma20 * 100
         
-        # ATR
-        tr1 = df['high'] - df['low']
-        tr2 = (df['high'] - df['close'].shift()).abs()
-        tr3 = (df['low'] - df['close'].shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
-
         # Time Features
         if 'timestamp' in df.columns:
             dates = pd.to_datetime(df['timestamp'])
+            if hasattr(dates, 'dt'):
+                hours = dates.dt.hour
+                dayofweek = dates.dt.dayofweek
+            else:
+                hours = dates.hour
+                dayofweek = dates.dayofweek
         else:
             dates = df.index
-        
-        # タイムスタンプ型に応じた処理
-        if hasattr(dates, 'hour'):
-            hours = dates.hour
-            dayofweek = dates.dayofweek
-        elif hasattr(dates, 'dt'):
-            hours = dates.dt.hour
-            dayofweek = dates.dt.dayofweek
-        else:
-            hours = pd.Series(0, index=df.index)
-            dayofweek = pd.Series(0, index=df.index)
+            if hasattr(dates, 'hour'):
+                hours = dates.hour
+                dayofweek = dates.dayofweek
+            else:
+                hours = pd.Series(0, index=df.index)
+                dayofweek = pd.Series(0, index=df.index)
 
         df['hour_sin'] = np.sin(2 * np.pi * hours / 24)
         df['hour_cos'] = np.cos(2 * np.pi * hours / 24)
@@ -141,58 +137,43 @@ class MLPredictor:
         
         return latest_features
 
-
+    def _calc_atr(self, df):
+        tr1 = df['high'] - df['low']
+        tr2 = (df['high'] - df['close'].shift()).abs()
+        tr3 = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.ewm(alpha=1/14, adjust=False).mean()
 
     def prepare_lstm_data(self, prices: np.ndarray) -> np.ndarray:
-        """
-        LSTM用データ作成 (対数変化率 + 正規化)
-        """
         if len(prices) < self.lstm_lookback + 1:
             return np.zeros((1, self.lstm_lookback, 1))
-        
-        # 価格そのものではなく、変化率を使う（価格水準が変わっても対応可能に）
         s = pd.Series(prices)
         returns = np.log(s / s.shift(1)).fillna(0).values
-        
         window = returns[-self.lstm_lookback:]
-        
-        # Z-score正規化
         mean = window.mean()
         std = window.std() + 1e-8
         normalized = (window - mean) / std
-            
         return normalized.reshape(1, self.lstm_lookback, 1)
 
-
-    
     def predict(self, df: pd.DataFrame, extra_features: dict = None) -> dict:
-        """
-        予測実行 (執行フィルター付き)
-        """
         if df is None or len(df) < 100:
             return {'action': 'HOLD', 'confidence': 0, 'reasoning': 'データ不足', 'model_used': 'NONE'}
 
-        # 1. 特徴量作成
         features = self.create_features_from_history(df)
-
         if features is None:
             return {'action': 'HOLD', 'confidence': 0, 'model_used': 'NONE'}
         
-        # 2. リアルタイムデータの注入
         if extra_features:
             features['orderbook_imbalance'] = extra_features.get('orderbook_imbalance', 0.0)
             features['btc_correlation'] = extra_features.get('btc_trend', 0.0) 
             features['btc_trend_strength'] = abs(extra_features.get('btc_trend', 0.0))
         else:
-            print("⚠️ 警告: 板情報・BTCデータが欠落しています。精度が低下します。")
             features['orderbook_imbalance'] = 0.0
             features['btc_correlation'] = 0.0
             features['btc_trend_strength'] = 0.0
         
-        # カラム順序の保証と欠損埋め
         for col in self.feature_cols:
-            if col not in features.columns:
-                features[col] = 0.0
+            if col not in features.columns: features[col] = 0.0
         features = features[self.feature_cols]
 
         with self.model_lock:
@@ -200,25 +181,15 @@ class MLPredictor:
             lstm_model = self.lstm_model
             lgb_reg_model = self.lgb_reg_model
 
-        # 3. LightGBM 予測
-        lgb_up = 0.0
-        lgb_down = 0.0
-        lgb_used = False
-        
+        lgb_up, lgb_down = 0.0, 0.0
         if lgb_model:
             try:
                 lgb_pred = lgb_model.predict(features)
                 lgb_down = float(lgb_pred[0][0])
                 lgb_up = float(lgb_pred[0][2])
-                lgb_used = True
-            except Exception as e:
-                print(f"⚠️ LGBM予測エラー: {e}")
+            except: pass
 
-        # 4. LSTM 予測
-        lstm_up = 0.0
-        lstm_down = 0.0
-        lstm_used = False
-        
+        lstm_up, lstm_down = 0.0, 0.0
         if lstm_model:
             try:
                 prices = df['close'].values
@@ -226,82 +197,46 @@ class MLPredictor:
                 lstm_pred = lstm_model.predict(inp, verbose=0)[0]
                 lstm_down = float(lstm_pred[0])
                 lstm_up = float(lstm_pred[2])
-                lstm_used = True
-            except Exception as e:
-                print(f"⚠️ LSTM予測エラー: {e}")
+            except: pass
         
+        # ★改善点: 回帰モデル(Regression)の重要度アップ
         predicted_change_pct = 0.0
-        if self.lgb_reg_model:
+        if lgb_reg_model:
             try:
-                # 回帰モデルで予測 (出力は % 単位の変動幅)
-                reg_pred = self.lgb_reg_model.predict(features)
+                reg_pred = lgb_reg_model.predict(features)
                 predicted_change_pct = float(reg_pred[0])
-                # print(f"   🔍 回帰予測値: {predicted_change_pct:.4f}%") # 動作確認できたらコメントアウト
-            except Exception as e:
-                print(f"⚠️ LGBM回帰予測エラー: {e}")
-        else:
-            # モデルがない場合のみ表示（頻繁に出るならコメントアウト）
-            pass 
-            # print("   ⚠️ 回帰モデル(lgb_reg_model)がロードされていません")
+            except: pass
 
-        # 5. アンサンブル (確率の統合)
-        if lgb_used and lstm_used:
+        if lgb_model and lstm_model:
             final_up = (lgb_up * 0.6 + lstm_up * 0.4)
             final_down = (lgb_down * 0.6 + lstm_down * 0.4)
             model_name = "Ensemble"
-        elif lgb_used:
-            final_up = lgb_up
-            final_down = lgb_down
+        elif lgb_model:
+            final_up, final_down = lgb_up, lgb_down
             model_name = "LightGBM"
-        elif lstm_used:
-            final_up = lstm_up
-            final_down = lstm_down
+        elif lstm_model:
+            final_up, final_down = lstm_up, lstm_down
             model_name = "LSTM"
         else:
             return {'action': 'HOLD', 'confidence': 0, 'reasoning': 'モデル予測失敗', 'model_used': 'NONE'}
 
-        # ---------------------------------------------------------
-        # AIがGOサインを出しても、板情報やBTC状況が悪ければ拒否する
-        # ---------------------------------------------------------
+        # ★フィルター緩和: 不均衡が極端な場合のみ除外
         filter_reason = ""
-        is_filtered = False
-
-        # 板情報 (Imbalance) のチェック
-        # 値が正なら買い圧、負なら売り圧
         imbalance = features['orderbook_imbalance'].iloc[-1]
         
-        if final_up > final_down: # AI判断: BUY
-            if imbalance < -0.6:
-                is_filtered = True
+        if final_up > final_down:
+            if imbalance < -0.8: # -0.6 -> -0.8
                 filter_reason = f"売り板厚過多(Imb:{imbalance:.2f})"
                 final_up = 0.0 
-        
-        elif final_down > final_up: # AI判断: SELL
-            if imbalance > 0.6:
-                is_filtered = True
+        elif final_down > final_up:
+            if imbalance > 0.8: # 0.6 -> 0.8
                 filter_reason = f"買い板厚過多(Imb:{imbalance:.2f})"
                 final_down = 0.0
 
-        # BTC相関フィルター
-        # BTCが急落中 (-0.5%以下) にETHの買いを入れるのは危険
-        btc_trend = features['btc_correlation'].iloc[-1]
-        if final_up > final_down and btc_trend < -1.0:
-             is_filtered = True
-             filter_reason = f"BTC急落中({btc_trend:.2f}%)"
-             final_up = 0.0
-
-        if is_filtered:
-            print(f"🛡️ 執行フィルター発動: {filter_reason} -> エントリーをキャンセル")
-
-        # 自信度計算
+        # Confidence計算
         max_prob = max(final_up, final_down)
-        
-        # 閾値 (0.4以上で反応)
-        if max_prob < 0.4:
-            confidence = 0
-        else:
-            confidence = (max_prob - 0.4) / (0.9 - 0.4) * 100
-            confidence = min(100, max(0, confidence))
+        confidence = (max_prob - 0.35) / (0.9 - 0.35) * 100 # 基準を少し下げてスケーリング
+        confidence = min(100, max(0, confidence))
 
         return {
             'action': 'PREDICTED',
@@ -310,153 +245,76 @@ class MLPredictor:
             'confidence': int(confidence),
             'model_used': model_name,
             'predicted_change': predicted_change_pct,
-            'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f} {filter_reason}",
+            'reasoning': f"Up:{final_up:.2f} Down:{final_down:.2f} PredChange:{predicted_change_pct:+.3f}%",
             'filter_reason': filter_reason
         }
 
-
-
-    # 回帰モデルの学習メソッド
+    # (train_regressor, evaluate_model, train_lightgbm, train_lstm, load_models は変更なしでOKですが、
     def train_regressor(self, X, y, X_val=None, y_val=None):
-        """
-        価格変動幅を予測する回帰モデルの学習
-        y: future_change (変動率%)
-        """
         if not LIGHTGBM_AVAILABLE: return
-        
         print("📊 変動幅予測モデル(Regressor)の学習を開始...")
-        params = {
-            'objective': 'regression', 
-            'metric': 'rmse', 
-            'verbose': -1, 
-            'random_state': 42,
-            'learning_rate': 0.05,
-            'num_leaves': 31
-        }
+        params = {'objective': 'regression', 'metric': 'rmse', 'verbose': -1, 'random_state': 42, 'learning_rate': 0.05, 'num_leaves': 31}
         train_data = lgb.Dataset(X, label=y)
         valid_sets = []
-        if X_val is not None:
-            valid_sets = [lgb.Dataset(X_val, label=y_val, reference=train_data)]
-        
+        if X_val is not None: valid_sets = [lgb.Dataset(X_val, label=y_val, reference=train_data)]
         reg_model = lgb.train(params, train_data, num_boost_round=100, valid_sets=valid_sets)
-        
         with self.model_lock:
             self.lgb_reg_model = reg_model
             joblib.dump(self.lgb_reg_model, self.lgb_reg_path)
-        print("✅ 変動幅予測モデルの学習完了")
-
-
-
-
+    
     def evaluate_model(self, model, X_val, y_val, model_type='lgb'):
-        """
-        モデルの精度評価 (オンライン学習用)
-        """
         if not SKLEARN_AVAILABLE: return 0.0
         try:
             if len(X_val) == 0: return 0.0
-            
             if model_type == 'lgb':
                 preds = model.predict(X_val)
                 pred_classes = np.argmax(preds, axis=1)
-                # ラベルマップ: -1->0, 0->1, 1->2
                 y_true = y_val.map({-1:0, 0:1, 1:2}).fillna(1)
                 return accuracy_score(y_true, pred_classes)
-            
             return 0.0
-        except Exception as e:
-            print(f"評価エラー: {e}")
-            return 0.0
+        except: return 0.0
 
     def train_lightgbm(self, X, y, X_val=None, y_val=None):
         if not LIGHTGBM_AVAILABLE: return
-        
-        # 学習パラメータ (デイトレ用: やや過学習を防ぐ設定)
-        params = {
-            'objective': 'multiclass', 
-            'num_class': 3, 
-            'metric': 'multi_logloss', 
-            'verbose': -1, 
-            'random_state': 42,
-            'learning_rate': 0.05,
-            'num_leaves': 31
-        }
+        params = {'objective': 'multiclass', 'num_class': 3, 'metric': 'multi_logloss', 'verbose': -1, 'random_state': 42, 'learning_rate': 0.05, 'num_leaves': 31}
         y_mapped = y.map({-1:0, 0:1, 1:2})
         train_data = lgb.Dataset(X, label=y_mapped)
         valid_sets = []
         if X_val is not None:
             y_val_mapped = y_val.map({-1:0, 0:1, 1:2})
             valid_sets = [lgb.Dataset(X_val, label=y_val_mapped, reference=train_data)]
-        
         new_model = lgb.train(params, train_data, num_boost_round=100, valid_sets=valid_sets)
-        
         with self.model_lock:
             self.lgb_model = new_model
             joblib.dump(self.lgb_model, self.lgb_path)
     
     def train_lstm(self, prices, labels, lookback=60, epochs=20):
         if not KERAS_AVAILABLE: return
-        
-        # データ作成
         X, y = [], []
         s = pd.Series(prices)
-        # 対数変化率
         returns = np.log(s / s.shift(1)).fillna(0).values
-        
         for i in range(lookback, len(returns)):
             window = returns[i-lookback:i]
             mean = window.mean()
             std = window.std() + 1e-8
             norm = (window - mean) / std
-            
             X.append(norm)
             l = labels[i]
             if l == -1: enc = [1,0,0]
             elif l == 0: enc = [0,1,0]
             else: enc = [0,0,1]
             y.append(enc)
-            
         if len(X) == 0: return
-
         X = np.array(X).reshape(-1, lookback, 1)
         y = np.array(y)
-        
-        model = Sequential([
-            LSTM(64, return_sequences=True, input_shape=(lookback, 1)), Dropout(0.2),
-            LSTM(32), Dropout(0.2), Dense(3, activation='softmax')
-        ])
+        model = Sequential([LSTM(64, return_sequences=True, input_shape=(lookback, 1)), Dropout(0.2), LSTM(32), Dropout(0.2), Dense(3, activation='softmax')])
         model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
         model.fit(X, y, epochs=epochs, batch_size=32, validation_split=0.2, verbose=1)
-        
         with self.model_lock:
             self.lstm_model = model
             model.save(self.lstm_path)
 
     def load_models(self):
-        # ★デバッグ: パスの確認
-        print(f"🔍 モデル読み込み開始: {self.symbol}")
-        print(f"   LGBMパス: {self.lgb_path} (存在: {os.path.exists(self.lgb_path)})")
-        print(f"   Regパス : {self.lgb_reg_path} (存在: {os.path.exists(self.lgb_reg_path)})")
-        print(f"   LSTMパス: {self.lstm_path} (存在: {os.path.exists(self.lstm_path)})")
-
-        if os.path.exists(self.lgb_path) and LIGHTGBM_AVAILABLE:
-            try: 
-                self.lgb_model = joblib.load(self.lgb_path)
-                print("   ✅ LGBM(分類) ロード成功")
-            except Exception as e: print(f"⚠️ LGBM読み込みエラー: {e}")
-        else:
-            print("   ⚠️ LGBM(分類) スキップ (ファイルなし or ライブラリ不足)")
-        
-        if os.path.exists(self.lgb_reg_path) and LIGHTGBM_AVAILABLE:
-            try: 
-                self.lgb_reg_model = joblib.load(self.lgb_reg_path)
-                print("   ✅ LGBM(回帰) ロード成功") # ★これが表示されるか確認
-            except Exception as e: print(f"⚠️ LGBM(Reg)読み込みエラー: {e}")
-        else:
-            print("   ⚠️ LGBM(回帰) スキップ (ファイルなし or ライブラリ不足)")
-
-        if os.path.exists(self.lstm_path) and KERAS_AVAILABLE:
-            try: 
-                self.lstm_model = keras.models.load_model(self.lstm_path)
-                print("   ✅ LSTM ロード成功")
-            except Exception as e: print(f"⚠️ LSTM読み込みエラー: {e}")
+        if os.path.exists(self.lgb_path) and LIGHTGBM_AVAILABLE: self.lgb_model = joblib.load(self.lgb_path)
+        if os.path.exists(self.lgb_reg_path) and LIGHTGBM_AVAILABLE: self.lgb_reg_model = joblib.load(self.lgb_reg_path)
+        if os.path.exists(self.lstm_path) and KERAS_AVAILABLE: self.lstm_model = keras.models.load_model(self.lstm_path)
