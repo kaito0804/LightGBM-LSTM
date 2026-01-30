@@ -21,7 +21,7 @@ load_dotenv()
 MAIN_TIMEFRAME = os.getenv('MAIN_TIMEFRAME', '15m')  # デイトレードの主軸
 SUB_TIMEFRAME = '1h'                                 # トレンド確認・大きな波用
 
-# ★修正: 緊急損切り・利確設定を.envから取得 (変数の定義漏れを修正)
+# 緊急損切り・利確設定を.envから取得 (変数の定義漏れを修正)
 EMERGENCY_SL_PCT = float(os.getenv('EMERGENCY_STOP_LOSS', '-3.0'))
 SECURE_PROFIT_TP_PCT = float(os.getenv('SECURE_TAKE_PROFIT', '6.0'))
 

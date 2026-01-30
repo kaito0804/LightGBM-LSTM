@@ -1,10 +1,8 @@
-# google_sheets_logger.py (時間軸カラム追加版)
+# google_sheets_logger.py (即時反映・バッファ削除版)
 
 import os
-import time
 from datetime import datetime
 from typing import Dict, List, Any
-from collections import deque
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
@@ -14,7 +12,7 @@ load_dotenv()
 class GoogleSheetsLogger:
     """
     Google Sheetsへ取引結果を記録・可視化
-    「AI分析」シートに時間軸(Timeframe)カラムを追加
+    バッファリングを行わず、ログ発生時に即座にシートへ書き込みます。
     """
     
     DEFAULT_SPREADSHEET_NAME = "Hyperliquid_AI_Journal"
@@ -29,15 +27,6 @@ class GoogleSheetsLogger:
         self.client = None
         self.spreadsheet = None
         self.creds_path = os.getenv('GOOGLE_SHEETS_CREDENTIALS', 'credentials.json')
-        
-        # バッファリング
-        self.buffer = {
-            'executions': deque(maxlen=20),
-            'ai_analysis': deque(maxlen=50),
-            'equity': deque(maxlen=50)
-        }
-        self.last_flush = time.time()
-        self.flush_interval = 60  # 1分
         
         self._authenticate()
         self._setup_spreadsheet()
@@ -69,8 +58,6 @@ class GoogleSheetsLogger:
 
     def _ensure_sheets_exist(self):
         """必要なシートを作成・ヘッダー設定"""
-        
-        # AI分析シートの2列目に「時間軸」を追加
         sheets_config = [
             ("実行履歴", ["日時", "アクション", "方向", "数量(ETH)", "価格($)", "手数料($)", "実現損益($)", "残高($)", "理由"]),
             ("AI分析", ["日時", "時間軸", "現在価格", "AI判断", "信頼度(%)", "上昇確率(%)", "下降確率(%)", "市場レジーム", "使用モデル", "RSI", "Volatility", "前回答え合わせ", "予測判定"]),
@@ -84,12 +71,10 @@ class GoogleSheetsLogger:
     def _setup_sheet(self, title: str, headers: List[str]):
         try:
             sheet = self.spreadsheet.worksheet(title)
-            # 既存シートのヘッダー更新（カラムが増えた場合の対応）
             current_headers = sheet.row_values(1)
             if len(current_headers) < len(headers):
                 print(f"⚠️ シート '{title}' のヘッダーを更新します...")
                 sheet.resize(cols=len(headers))
-                # 1行目を上書き
                 for i, h in enumerate(headers):
                     sheet.update_cell(1, i+1, h)
                     
@@ -103,7 +88,8 @@ class GoogleSheetsLogger:
             })
             sheet.freeze(rows=1)
 
-    # ========== ログ記録メソッド ==========
+    # ========== ログ記録メソッド (即時書き込み) ==========
+    
     def log_execution(self, data: Dict[str, Any]):
         """実行履歴に追加"""
         row = [
@@ -117,14 +103,12 @@ class GoogleSheetsLogger:
             data.get('balance'),
             data.get('reasoning')
         ]
-        self.buffer['executions'].append(row)
-        self._try_flush()
+        self._write_immediate("実行履歴", row)
 
     def log_ai_analysis(self, data: Dict[str, Any]):
-        """AI分析に追加 (時間軸対応)"""
+        """AI分析に追加"""
         up_prob = data.get('up_prob', 0) * 100
         down_prob = data.get('down_prob', 0) * 100
-        
         timeframe = data.get('timeframe', '-') 
         
         row = [
@@ -142,10 +126,12 @@ class GoogleSheetsLogger:
             data.get('eval_result', '-'),
             data.get('prediction_result', '-')
         ]
-        self.buffer['ai_analysis'].append(row)
-        self._try_flush()
+        
+        # AI分析は色塗り処理があるため専用メソッド経由かフラグ処理
+        self._write_immediate("AI分析", row, is_ai_analysis=True)
 
     def log_equity(self, data: Dict[str, Any]):
+        """資産推移に追加"""
         row = [
             data.get('timestamp', datetime.now()).strftime('%Y-%m-%d %H:%M:%S'),
             data.get('account_value'),
@@ -154,10 +140,10 @@ class GoogleSheetsLogger:
             data.get('unrealized_pnl', 0),
             data.get('realized_pnl_cumulative', 0)
         ]
-        self.buffer['equity'].append(row)
-        self._try_flush()
+        self._write_immediate("資産推移", row)
 
     def log_trade_result(self, data: Dict[str, Any]):
+        """トレード履歴 (既存のまま)"""
         if not self.spreadsheet: return
         try:
             pnl = float(data.get('pnl', 0))
@@ -179,69 +165,54 @@ class GoogleSheetsLogger:
                 data.get('exit_reason')
             ]
             sheet = self.spreadsheet.worksheet("Trade_History")
+            # 2行目に挿入（最新を上に）
             sheet.insert_row(row, index=2, value_input_option='USER_ENTERED')
             print(f"📝 トレード履歴記録完了: {result_icon} ${pnl}")
         except Exception as e:
             print(f"⚠️ トレード履歴ログエラー: {e}")
 
-    # ========== バッファ処理 ==========
-    def _try_flush(self, force: bool = False):
-        elapsed = time.time() - self.last_flush
-        is_full = (len(self.buffer['executions']) >= 5 or 
-                   len(self.buffer['ai_analysis']) >= 20 or 
-                   len(self.buffer['equity']) >= 20)
-        
-        if force or elapsed >= self.flush_interval or is_full:
-            self.force_flush()
+    # ========== 内部ヘルパー ==========
 
-    def _flush_buffer_to_sheet(self, sheet_name: str, buffer_key: str):
-        if self.buffer[buffer_key]:
-            sheet = self.spreadsheet.worksheet(sheet_name)
-            rows = list(self.buffer[buffer_key])
-            rows.reverse()
-            sheet.insert_rows(rows, row=2, value_input_option='USER_ENTERED')
-            if buffer_key == 'ai_analysis':
-                self._apply_ai_formatting(sheet, rows)
-            self.buffer[buffer_key].clear()
-
-    def _apply_ai_formatting(self, sheet, rows):
-        """AI分析シートの条件付き色塗り"""
+    def _write_immediate(self, sheet_name: str, row: List[Any], is_ai_analysis: bool = False):
+        """指定したシートの2行目に即座に行を追加する"""
+        if not self.spreadsheet: return
         try:
-            formats = []
-            for i, row_data in enumerate(rows):
-                # headers: ["日時", "時間軸", "現在価格", "AI判断", ...] -> AI判断は Index 3
-                action = row_data[3]
-                
-                color = None
-                if action == 'BUY' or action == 'STRONG_BUY':
-                    color = {"red": 0.85, "green": 0.95, "blue": 1.0}
-                elif action == 'SELL' or action == 'STRONG_SELL':
-                    color = {"red": 1.0, "green": 0.85, "blue": 0.85}
-                elif action == 'CLOSE':
-                    color = {"red": 1.0, "green": 1.0, "blue": 0.85}
-                else:
-                    color = {"red": 1.0, "green": 1.0, "blue": 1.0}
-                
-                if color:
-                    # 範囲計算 (A列〜M列) ※列が増えたのでMまで
-                    row_idx = 2 + i
-                    rng = f"A{row_idx}:M{row_idx}"
-                    formats.append({"range": rng, "format": {"backgroundColor": color}})
+            sheet = self.spreadsheet.worksheet(sheet_name)
+            sheet.insert_row(row, index=2, value_input_option='USER_ENTERED')
             
-            if formats:
-                sheet.batch_format(formats)
+            if is_ai_analysis:
+                self._apply_ai_formatting_single(sheet, row)
+                
+        except Exception as e:
+            print(f"⚠️ シート '{sheet_name}' 書き込みエラー: {e}")
+
+    def _apply_ai_formatting_single(self, sheet, row_data):
+        """AI分析シートの挿入行（2行目）に色を塗る"""
+        try:
+            # headers: ["日時", "時間軸", "現在価格", "AI判断", ...] -> AI判断は Index 3
+            action = row_data[3]
+            
+            color = None
+            if action == 'BUY' or action == 'STRONG_BUY':
+                color = {"red": 0.85, "green": 0.95, "blue": 1.0}
+            elif action == 'SELL' or action == 'STRONG_SELL':
+                color = {"red": 1.0, "green": 0.85, "blue": 0.85}
+            elif action == 'CLOSE':
+                color = {"red": 1.0, "green": 1.0, "blue": 0.85}
+            else:
+                color = {"red": 1.0, "green": 1.0, "blue": 1.0}
+            
+            if color:
+                # 2行目のA列〜M列を対象
+                rng = "A2:M2"
+                sheet.format(rng, {"backgroundColor": color})
+                
         except Exception as e:
             print(f"⚠️ シート色塗りエラー (無視して続行): {e}")
 
     def force_flush(self):
-        try:
-            self._flush_buffer_to_sheet("実行履歴", 'executions')
-            self._flush_buffer_to_sheet("AI分析", 'ai_analysis')
-            self._flush_buffer_to_sheet("資産推移", 'equity')
-            self.last_flush = time.time()
-            print("📝 Google Sheetsログ同期完了")
-        except Exception as e:
-            print(f"⚠️ ログ書き込みエラー: {e}")
+        """互換性のために残すが何もしない"""
+        pass
 
     def get_spreadsheet_url(self) -> str:
         return self.spreadsheet.url if self.spreadsheet else "未接続"
