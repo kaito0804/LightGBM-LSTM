@@ -175,7 +175,7 @@ class TradingBot:
                 
                 if net_profit > 0:
                     # 手数料を引いてもプラス -> エントリーすべきだった
-                    result_text = f"❌ 機会損失 (Long利幅 +{net_profit:.2f}% ※手数料引)"
+                    result_text = f"🔼 機会損失 (Long利幅 +{net_profit:.2f}% ※手数料引)"
                 elif pct_change < -0.1:
                     # 明らかに下がった
                     result_text = f"❌ 予測失敗 (上昇予想も下落 {pct_change:.2f}%)"
