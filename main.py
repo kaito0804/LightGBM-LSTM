@@ -145,7 +145,9 @@ class TradingBot:
     # ヘルパー: 前回の答え合わせ
     # -----------------------------------------------------------
     def _evaluate_last_prediction(self, current_price: float, timeframe: str) -> str:
-        """前回の予測が正しかったか答え合わせをする"""
+        """
+        前回の予測が正しかったか答え合わせをする
+        """
         last_state = self.last_prediction_state.get(timeframe)
         if not last_state:
             return "-"
@@ -158,36 +160,47 @@ class TradingBot:
         # 変動率 (%)
         pct_change = (current_price - last_price) / last_price * 100
         
-        # 手数料等のコスト閾値
-        COST_THRESHOLD = 0.1
+        # 0.1%以上動かないとノイズとみなす
+        MOVE_THRESHOLD = 0.1
         
         result_text = "-"
 
         # ケースA: 前回 HOLD だった場合
         if last_action == 'HOLD':
-            long_pnl = pct_change - COST_THRESHOLD
-            short_pnl = -pct_change - COST_THRESHOLD
-            
+            # === AIが「上昇」寄りだった場合 ===
             if up_prob > down_prob:
-                if long_pnl > 0.1: 
-                    result_text = f"❌ 機会損失 (Longで+{long_pnl:.2f}%)"
+                if pct_change > MOVE_THRESHOLD:
+                    # 上がった (方向は正解だがエントリーせず)
+                    result_text = f"❌ 機会損失 (Longで+{pct_change:.2f}%)"
+                elif pct_change < -MOVE_THRESHOLD:
+                    # 下がった (予測大外れ)
+                    result_text = f"❌ 予測失敗 (上昇予想も下落 {pct_change:.2f}%)"
                 else:
-                    result_text = f"✅ 正解Hold (動かず)"
+                    # 動かなかった (Wait正解)
+                    result_text = f"✅ 正解Hold (レンジ)"
+
+            # === AIが「下落」寄りだった場合 ===
             else:
-                if short_pnl > 0.1:
-                    result_text = f"❌ 機会損失 (Shortで+{short_pnl:.2f}%)"
+                if pct_change < -MOVE_THRESHOLD:
+                    # 下がった (方向は正解だがエントリーせず)
+                    result_text = f"❌ 機会損失 (Shortで+{abs(pct_change):.2f}%)"
+                elif pct_change > MOVE_THRESHOLD:
+                    # 上がった (予測大外れ)
+                    result_text = f"❌ 予測失敗 (下落予想も上昇 +{pct_change:.2f}%)"
                 else:
-                    result_text = f"✅ 正解Hold (動かず)"
+                    # 動かなかった
+                    result_text = f"✅ 正解Hold (レンジ)"
 
         # ケースB: 前回 BUY だった場合
         elif last_action == 'BUY':
-            real_pnl = pct_change - COST_THRESHOLD
+            # 手数料(0.1%)を引いて利益が出ているか
+            real_pnl = pct_change - 0.1
             if real_pnl > 0: result_text = f"✅ 勝利 (+{real_pnl:.2f}%)"
             else: result_text = f"❌ 敗北 ({real_pnl:.2f}%)"
 
         # ケースC: 前回 SELL だった場合
         elif last_action == 'SELL':
-            real_pnl = -pct_change - COST_THRESHOLD
+            real_pnl = -pct_change - 0.1
             if real_pnl > 0: result_text = f"✅ 勝利 (+{real_pnl:.2f}%)"
             else: result_text = f"❌ 敗北 ({real_pnl:.2f}%)"
 
@@ -305,6 +318,8 @@ class TradingBot:
                         'eval_result': eval_result,
                         **decision_15m 
                     })
+
+                    time.sleep(3)
 
                 # --- 1時間足のAI予測 ---
                 if is_new_1h:
