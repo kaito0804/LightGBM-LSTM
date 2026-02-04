@@ -16,7 +16,7 @@ CSV_FILE = "backtest_data_ETH_USDT_15m.csv"
 INITIAL_CAPITAL = 500.0
 FEE_RATE = 0.00035
 
-# ★修正1: エントリー基準を上げて「無駄打ち」を防ぐ
+# エントリー基準を上げて「無駄打ち」を防ぐ
 # 0.40だとノイズを拾いすぎるため、上位数%のチャンスに絞る
 BASE_THRESHOLD = 0.44
 
@@ -196,7 +196,7 @@ class AccurateBacktester:
                 elif elapsed_min >= 30:
                     if not ctx.get('check_30m'):
                         ctx['check_30m'] = True
-                        # ★修正: 厳格審査(+0.02)をやめ、基準値(0.44)を割っていなければOKとする
+                        # 厳格審査(+0.02)をやめ、基準値(0.44)を割っていなければOKとする
                         if side == 'LONG' and up_prob < BASE_THRESHOLD:
                             action = 'CLOSE'; reason = '30m Check Failed'
                         elif side == 'SHORT' and down_prob < BASE_THRESHOLD:

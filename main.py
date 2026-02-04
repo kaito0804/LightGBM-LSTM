@@ -21,7 +21,7 @@ load_dotenv()
 MAIN_TIMEFRAME = os.getenv('MAIN_TIMEFRAME', '15m')  # デイトレードの主軸
 SUB_TIMEFRAME = '1h'                                 # トレンド確認・大きな波用
 
-# 緊急損切り・利確設定を.envから取得 (変数の定義漏れを修正)
+# 緊急損切り・利確設定を.envから取得
 EMERGENCY_SL_PCT = float(os.getenv('EMERGENCY_STOP_LOSS', '-3.0'))
 SECURE_PROFIT_TP_PCT = float(os.getenv('SECURE_TAKE_PROFIT', '6.0'))
 
@@ -141,6 +141,8 @@ class TradingBot:
         except Exception as e:
             print(f"⚠️ 状態復元エラー: {e}")
 
+
+
     # -----------------------------------------------------------
     # ヘルパー: 前回の答え合わせ
     # -----------------------------------------------------------
@@ -193,7 +195,7 @@ class TradingBot:
                 
                 if net_profit > 0:
                     # 手数料を引いてもプラス
-                    result_text = f"❌ 機会損失 (Short利幅 +{net_profit:.2f}% ※手数料引)"
+                    result_text = f"🔼 機会損失 (Short利幅 +{net_profit:.2f}% ※手数料引)"
                 elif pct_change > 0.1:
                     # 明らかに上がった
                     result_text = f"❌ 予測失敗 (下落予想も上昇 +{pct_change:.2f}%)"
@@ -240,7 +242,8 @@ class TradingBot:
                 current_price = self.trader.get_current_price(self.symbol)
                 account_state = self.trader.get_user_state()
                 
-                if not current_price:
+                if not current_price or account_state is None:
+                    print(f"⚠️ データ取得失敗 (Price: {current_price}, Account: {'OK' if account_state else 'NG'}) - スキップ")
                     time.sleep(interval)
                     continue
 
@@ -263,9 +266,17 @@ class TradingBot:
                         time_limit = 60 if current_tf == '15m' else 240
                         
                         if elapsed > time_limit: 
-                            print(f"⏰ {time_limit}分経過 ({current_tf}): タイムリミット決済")
-                            self.trader.close_position(self.symbol)
-                            self.last_entry_time = None
+                            print(f"⏰ {time_limit}分経過 ({current_tf}): タイムリミット決済実行中...")
+                            # 決済が成功したか確認する
+                            result = self.trader.close_position(self.symbol)
+                            if result and result.get('status') == 'ok':
+                                print("✅ タイムリミット決済成功")
+                                self.last_entry_time = None
+                                self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE', 'timeframe': '15m'}
+                                self._save_bot_state()
+                            else:
+                                print("❌ タイムリミット決済失敗: 次回ループでリトライします")
+                            
                             time.sleep(interval)
                             continue
 
@@ -413,8 +424,27 @@ class TradingBot:
             self.online_learner.stop_background_learning()
             self.running = False
 
+        except Exception as e:
+            # 🔥 予期せぬエラーで停止した場合のログ記録
+            print(f"\n🔥 システム異常停止: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.log_to_sheets(trade_data={
+                'timestamp': datetime.now(),
+                'symbol': self.symbol,
+                'action': 'SYSTEM_CRASH', # 異常停止を示すアクション名
+                'side': 'NONE',
+                'size': 0,
+                'price': 0,
+                'reasoning': f'Error: {str(e)}' # エラー内容を記録
+            })
+            self.online_learner.stop_background_learning()
+            self.running = False
+            raise e # エラーを再送出してプログラムを終了させる
+
     # -----------------------------------------------------------
-    # 2. AI判定ロジック: .envから値を取得するように修正済み
+    # 2. AI判定ロジック
     # -----------------------------------------------------------
     def get_ml_decision(self, predictor, market_analysis: dict, account_state: dict, timeframe: str) -> dict:
         """
@@ -423,6 +453,12 @@ class TradingBot:
         indicators = market_analysis.get('indicators', {})
         rsi = indicators.get('rsi', market_analysis.get('rsi', 50))
         volatility = market_analysis.get('volatility', 0)
+        rec = market_analysis.get('recommendation', 'HOLD')
+        
+        # 4時間足などが「強い買い(STRONG_BUY)」「買い(BUY)」と言っていないのに、AIがBUYしようとしたら止める
+        force_trend_filter = False
+        if volatility > 3.0: # 高ボラティリティの閾値
+            force_trend_filter = True
         
         try:
             # === データ準備 ===
@@ -530,6 +566,23 @@ class TradingBot:
                             reasoning = f"Wait: 確率不足 (Down:{down_pct:.0f}% < 基準{thresh_pct:.0f}%)"
                         else:
                             reasoning = f"Wait: EV不足 (Down EV:{ev_score_down:.3f} < 基準{EV_THRESHOLD})"
+
+            # ▼▼▼▼▼ フィルター適用 ▼▼▼▼▼
+            if force_trend_filter:
+                if current_trend == "BUY" and rec not in ['BUY', 'STRONG_BUY']:
+                    return {
+                        'action': 'HOLD', 'confidence': 0, 
+                        'reasoning': f"Wait: 高ボラ警戒 - 全体トレンド({rec})と不一致",
+                        'ml_probabilities': {'up': up_prob, 'down': down_prob},
+                        'rsi': rsi, 'volatility': volatility
+                    }
+                elif current_trend == "SELL" and rec not in ['SELL', 'STRONG_SELL']:
+                    return {
+                        'action': 'HOLD', 'confidence': 0, 
+                        'reasoning': f"Wait: 高ボラ警戒 - 全体トレンド({rec})と不一致",
+                        'ml_probabilities': {'up': up_prob, 'down': down_prob},
+                        'rsi': rsi, 'volatility': volatility
+                    }
 
             # リスクパラメータ
             volatility = market_analysis.get('volatility', 2.0)
@@ -773,41 +826,50 @@ class TradingBot:
             else:
                 print("❌ 取引失敗")
 
-        self.log_to_sheets(
-            trade_data={
-                'timestamp': datetime.now(),
-                'symbol': self.symbol,
-                'action': action,
-                'side': side,
-                'size': size,
-                'price': current_price,
-                'order_value': order_value,
-                'fee': estimated_fee if trade_success else 0,
-                'realized_pnl': 0, 
-                'unrealized_pnl': unrealized_pnl, 
-                'confidence': confidence,
-                'balance': available_balance,
-                'reasoning': reasoning + ai_forecast_info
-            },
-            signal_data={
-                'timestamp': datetime.now(),
-                'timeframe': timeframe,
-                'symbol': self.symbol,
-                'action': action,
-                'confidence': confidence,
-                'ml_probabilities': decision.get('ml_probabilities', {}),
-                'price': current_price,
-                'prediction_result': decision.get('prediction_result', '-')
-            },
-            snapshot_data={
-                'timestamp': datetime.now(),
-                'account_value': account_value,
-                'available_balance': available_balance,
-                'unrealized_pnl': unrealized_pnl,
-                'realized_pnl_cumulative': 0,
-                'position_size': size if trade_success and action != 'CLOSE' else 0,
-            }
-        )
+        # 【修正】trade_successがTrueの時のみログを送信し、重複するsignal_dataは送信しない
+        if trade_success:
+            self.log_to_sheets(
+                trade_data={
+                    'timestamp': datetime.now(),
+                    'symbol': self.symbol,
+                    'action': action,
+                    'side': side,
+                    'size': size,
+                    'price': current_price,
+                    'order_value': order_value,
+                    'fee': estimated_fee,
+                    'realized_pnl': 0, 
+                    'unrealized_pnl': unrealized_pnl, 
+                    'confidence': confidence,
+                    'balance': available_balance,
+                    'reasoning': reasoning + ai_forecast_info
+                },
+                # 重複防止のため signal_data は送信しない
+                snapshot_data={
+                    'timestamp': datetime.now(),
+                    'account_value': account_value,
+                    'available_balance': available_balance,
+                    'unrealized_pnl': unrealized_pnl,
+                    'realized_pnl_cumulative': 0,
+                    'position_size': size if action != 'CLOSE' else 0,
+                }
+            )
+        else:
+            # ⚠️ 取引失敗（APIエラー等）の場合
+            print(f"⚠️ 取引失敗のためエラーログを記録します")
+            self.log_to_sheets(
+                trade_data={
+                    'timestamp': datetime.now(),
+                    'symbol': self.symbol,
+                    'action': 'EXECUTION_ERROR', # エラーとして記録
+                    'side': side,
+                    'size': size,
+                    'price': current_price,
+                    'reasoning': f"Failed to {action} (API Error or Invalid State)"
+                }
+            )
+
+
 
     def check_daily_exit(self, account_state: dict):
         now = datetime.utcnow()
@@ -815,17 +877,28 @@ class TradingBot:
             pos_data = self._get_position_summary(account_state)
             if pos_data['found']:
                 print("\n⏰ 日次強制決済 (UTC 23:55)")
-                self.trader.close_position(self.symbol)
-                self.last_entry_time = None
-                self._save_bot_state()
-                self.log_to_sheets(trade_data={
-                    'timestamp': datetime.now(),
-                    'symbol': self.symbol,
-                    'action': 'CLOSE',
-                    'reasoning': 'Daily Force Close'
-                })
-                print("⏳ 翌日まで待機中...")
-                time.sleep(300) 
+                result = self.trader.close_position(self.symbol)
+                
+                # 成功時のみ状態を更新して待機
+                if result and result.get('status') == 'ok':
+                    print("✅ 日次決済成功: 翌日まで待機します")
+                    self.last_entry_time = None
+                    self.trade_context = {'entry_price': 0, 'entry_reason': '', 'size': 0, 'side': 'NONE', 'timeframe': '15m'}
+                    self._save_bot_state()
+                    
+                    self.log_to_sheets(trade_data={
+                        'timestamp': datetime.now(),
+                        'symbol': self.symbol,
+                        'action': 'CLOSE',
+                        'reasoning': 'Daily Force Close'
+                    })
+                    print("⏳ 翌日まで待機中...")
+                    time.sleep(300) 
+                else:
+                    print("❌ 日次決済失敗: リトライします")
+                    # 失敗した場合は sleep せず、次のループですぐに再試行させる
+
+
 
     def _check_emergency_exit(self, pos_data, current_price):
         entry_px = pos_data['entry_price']

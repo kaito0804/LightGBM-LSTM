@@ -348,7 +348,7 @@ class AdvancedMarketData:
             }
             analysis['timeframes'][tf] = tf_data
             
-            # --- ★修正箇所: 指定されたターゲット時間軸のデータを優先採用 ---
+            # --- 指定されたターゲット時間軸のデータを優先採用 ---
             if tf == target_tf:
                 analysis['indicators'] = {
                     'rsi': rsi,
